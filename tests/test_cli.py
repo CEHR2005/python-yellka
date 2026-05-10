@@ -35,6 +35,27 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertIn("ASSIR/Yellka balance manager", result.stdout)
+        self.assertIn("discord", result.stdout)
+        self.assertIn("Run Discord bot", result.stdout)
+        self.assertNotIn("telegram", result.stdout.lower())
+
+    def test_discord_command_requires_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            db_path = Path(temp) / "balance.sqlite3"
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(ROOT / "src")
+            env.pop("DISCORD_BOT_TOKEN", None)
+
+            result = subprocess.run(
+                [sys.executable, "-m", "yellka", "--db", str(db_path), "discord"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("DISCORD_BOT_TOKEN or --token is required", result.stderr)
 
     def test_cli_workflow_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

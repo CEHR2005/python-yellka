@@ -8,7 +8,7 @@ Python-бот и CLI для менеджмента баланса AP по пра
 - Считает награды за выполненные задачи по базе `Ядра Вычислений`, вектору, тематическому приоритету, бонусу полного закрытия ТЗ и каталожному коэффициенту из приложенного TXT.
 - Поддерживает покупки из документа: `Ядро Вычислений` `+0.05 AP`, векторные множители `+10%`, `Кэшбек-Шина` до 25%, `Ретроспективная Индексация`.
 - Показывает список выполненных задач и историю транзакций.
-- Может работать как Telegram bot без внешних Python-зависимостей.
+- Может работать как Discord bot через `discord.py`.
 
 ## Быстрый старт
 
@@ -25,26 +25,30 @@ python -m yellka --db ./balance.sqlite3 transactions
 
 По умолчанию база хранится в `~/.local/share/yellka/balance.sqlite3`. Путь можно задать через `--db` или переменную `YELLKA_DB`.
 
-## Telegram
+## Discord
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123:token"
-python -m yellka --db ./balance.sqlite3 telegram
+export DISCORD_BOT_TOKEN="token"
+python -m yellka --db ./balance.sqlite3 discord
 ```
+
+Для чтения текстовых команд включите Message Content Intent в настройках Discord
+приложения. По умолчанию используется префикс `!`; его можно изменить через
+`--prefix` или `YELLKA_DISCORD_PREFIX`.
 
 Поддерживаемые команды:
 
 ```text
-/balance
-/earn <amount> [note]
-/spend <amount> [note]
-/complete <title> [units]
-/tasks
-/history
-/buy_core
-/buy_vector [code|modeling|animation|sfx|gamedesign]
-/buy_cashback
-/buy_retro
+!balance
+!earn <amount> [note]
+!spend <amount> [note]
+!complete <title> [units]
+!tasks
+!history
+!buy_core
+!buy_vector [code|modeling|animation|sfx|gamedesign]
+!buy_cashback
+!buy_retro
 ```
 
 ## Правила расчета

@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Iterable
 
 from .catalog import CATALOG_ITEMS, VECTORS
+from .discord_bot import run_discord_bot
 from .money import format_ap, parse_ap
 from .service import EconomyError, EconomyService
-from .telegram import run_telegram_bot
 
 
 def default_db_path() -> Path:
@@ -76,8 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
     catalog = subparsers.add_parser("catalog", help="Show task catalog")
     catalog.add_argument("query", nargs="?")
 
-    telegram = subparsers.add_parser("telegram", help="Run Telegram polling bot")
-    telegram.add_argument("--token", default=os.environ.get("TELEGRAM_BOT_TOKEN"))
+    discord = subparsers.add_parser("discord", help="Run Discord bot")
+    discord.add_argument("--token", default=os.environ.get("DISCORD_BOT_TOKEN"))
+    discord.add_argument("--prefix", default=os.environ.get("YELLKA_DISCORD_PREFIX", "!"))
 
     return parser
 
@@ -147,8 +148,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.query and args.query.casefold() not in item.title.casefold() and args.query.casefold() not in item.key.casefold():
                     continue
                 print(f"{item.key:22} {format_ap(item.value):>6}  {item.title}")
-        elif args.command == "telegram":
-            run_telegram_bot(args.token, Path(args.db))
+        elif args.command == "discord":
+            run_discord_bot(args.token, Path(args.db), command_prefix=args.prefix)
         else:
             parser.error(f"Unknown command: {args.command}")
     except (EconomyError, KeyError, ValueError) as exc:
