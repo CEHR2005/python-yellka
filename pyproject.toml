@@ -5,14 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "python-yellka"
 version = "0.1.0"
-description = "SQLite-backed ASSIR/Yellka balance manager and bot"
+description = "SQLite-backed ASSIR/Yellka balance manager and Discord bot"
 readme = "readme.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
     { name = "CEHR2005" }
 ]
-dependencies = []
+dependencies = [
+    "discord.py>=2.3,<3",
+]
 
 [project.scripts]
 yellka = "yellka.cli:main"
