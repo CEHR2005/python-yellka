@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-yellka"
+version = "0.1.0"
+description = "SQLite-backed ASSIR/Yellka balance manager and bot"
+readme = "readme.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "CEHR2005" }
+]
+dependencies = []
+
+[project.scripts]
+yellka = "yellka.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
