@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.sqlite3
+*.sqlite3.discord.lock
 *.db
 .pytest_cache/
 .mypy_cache/
@@ -9,3 +10,4 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.env

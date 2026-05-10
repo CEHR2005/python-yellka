@@ -19,6 +19,10 @@ VECTOR_MAX_LEVEL = 10
 CASHBACK_MAX_LEVEL = 5
 RETROACTIVE_INDEXING_COST = Decimal("25.000")
 UPDATE_BONUS = Decimal("2.500")
+DEFAULT_DISCOUNT_START_BASE = Decimal("0.800")
+DEFAULT_DISCOUNT_PURCHASE_COST = Decimal("20.000")
+DEFAULT_HISTORICAL_STARTING_BALANCE = Decimal("0.000")
+DEFAULT_HISTORICAL_RETRO_BONUS = Decimal("0.000")
 
 
 class EconomyError(RuntimeError):
@@ -43,6 +47,23 @@ class TaskResult:
     id: int
     reward: Decimal
     retro_bonus: Decimal
+    retro_details: list[RetroBonusDetail]
+
+
+@dataclass(frozen=True)
+class RetroBonusDetail:
+    task_id: int
+    title: str
+    units: int
+    paid_base_rate: Decimal
+    current_base_rate: Decimal
+    vector_multiplier: Decimal
+    priority_multiplier: Decimal
+    full_close_bonus: Decimal
+    catalog_weight: Decimal
+    previous_reward: Decimal
+    updated_reward: Decimal
+    delta: Decimal
 
 
 @dataclass(frozen=True)
@@ -52,6 +73,38 @@ class UpgradeResult:
     target: str
     cost: Decimal
     cashback: Decimal
+
+
+@dataclass(frozen=True)
+class UpgradeQuote:
+    target: str
+    level_before: int | Decimal
+    level_after: int | Decimal
+    full_cost: Decimal
+    discount: Decimal
+    final_cost: Decimal
+    maxed: bool = False
+
+
+@dataclass(frozen=True)
+class UpgradeSpendEstimate:
+    core_spent: Decimal
+    vector_spent: Decimal
+    discount_spent: Decimal
+    vector_spent_by_key: dict[str, Decimal]
+    total_spent: Decimal
+    discount_start_base: Decimal
+
+
+@dataclass(frozen=True)
+class EarningsStats:
+    total_earned: Decimal
+    starting_balance: Decimal
+    task_earned: Decimal
+    retro_earned: Decimal
+    discount_gross: Decimal
+    discount_net: Decimal
+    premium_and_other_earned: Decimal
 
 
 class EconomyService:
@@ -102,8 +155,9 @@ class EconomyService:
         allow_negative: bool = False,
         kind: str = "expense",
     ) -> int:
+        amount = abs(parse_ap(amount))
         return self._add_transaction(
-            -parse_ap(amount), kind, note, allow_negative=allow_negative
+            -amount, kind, note, allow_negative=allow_negative
         )
 
     def complete_task(
@@ -151,9 +205,10 @@ class EconomyService:
                 INSERT INTO tasks (
                     created_at, title, vector, units, base_rate, vector_level,
                     vector_multiplier, priority_multiplier, full_close_bonus,
-                    catalog_weight, reward, retro_paid_base_rate, note
+                    catalog_weight, reward, current_reward,
+                    retro_paid_base_rate, premium_received, note
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -167,7 +222,9 @@ class EconomyService:
                     db_ap(full_close_bonus),
                     db_ap(task_weight),
                     db_ap(reward),
+                    db_ap(reward),
                     db_ap(base_rate),
+                    0,
                     note,
                 ),
             )
@@ -179,45 +236,119 @@ class EconomyService:
                 f"Выполнена задача: {item_title}",
                 task_id=task_id,
             )
-            retro_bonus = self._apply_retroactive_indexing(conn, exclude_task_id=task_id)
-            return TaskResult(task_id, reward, retro_bonus)
+            retro_details = self._apply_retroactive_indexing(
+                conn,
+                exclude_task_id=task_id,
+            )
+            retro_bonus = sum(
+                (detail.delta for detail in retro_details),
+                Decimal("0.000"),
+            )
+            return TaskResult(task_id, reward, parse_ap(retro_bonus), retro_details)
 
     def buy_core(self) -> UpgradeResult:
         with self._connect() as conn:
-            current_base = self._get_decimal(conn, "base_rate")
-            new_base = parse_ap(current_base + CORE_STEP)
-            cost = parse_ap(current_base * Decimal("10"))
+            quote = self._quote_core(conn)
             result = self._buy_upgrade(
                 conn,
                 upgrade_type="core",
                 target="Ядро Вычислений",
-                level_before=db_ap(current_base),
-                level_after=db_ap(new_base),
-                cost=cost,
+                level_before=db_ap(quote.level_before),
+                level_after=db_ap(quote.level_after),
+                cost=quote.full_cost,
                 cashback_eligible=True,
             )
-            self._set_meta(conn, "base_rate", db_ap(new_base))
+            self._set_meta(conn, "base_rate", db_ap(quote.level_after))
             return result
+
+    def quote_core_upgrade(self) -> UpgradeQuote:
+        with self._connect() as conn:
+            return self._quote_core(conn)
 
     def buy_vector(self, vector: str) -> UpgradeResult:
         vector_info = require_vector(vector)
         with self._connect() as conn:
-            current_level = self._get_int(conn, f"vector_level:{vector_info.key}")
-            if current_level >= VECTOR_MAX_LEVEL:
+            quote = self._quote_vector(conn, vector_info.key)
+            if quote.maxed:
                 raise EconomyError(f"Vector {vector_info.title} is already maxed")
-            new_level = current_level + 1
-            cost = parse_ap(Decimal(new_level) * Decimal("0.5"))
             result = self._buy_upgrade(
                 conn,
                 upgrade_type="vector",
                 target=vector_info.key,
-                level_before=str(current_level),
-                level_after=str(new_level),
-                cost=cost,
+                level_before=str(quote.level_before),
+                level_after=str(quote.level_after),
+                cost=quote.full_cost,
                 cashback_eligible=True,
             )
-            self._set_meta(conn, f"vector_level:{vector_info.key}", str(new_level))
+            self._set_meta(conn, f"vector_level:{vector_info.key}", str(quote.level_after))
             return result
+
+    def quote_vector_upgrade(self, vector: str) -> UpgradeQuote:
+        vector_info = require_vector(vector)
+        with self._connect() as conn:
+            return self._quote_vector(conn, vector_info.key)
+
+    def quote_vector_upgrades(self) -> dict[str, UpgradeQuote]:
+        with self._connect() as conn:
+            return {key: self._quote_vector(conn, key) for key in VECTORS}
+
+    def estimate_upgrade_spend(
+        self,
+    ) -> UpgradeSpendEstimate:
+        with self._connect() as conn:
+            return self._estimate_upgrade_spend(conn)
+
+    def get_earnings_stats(self) -> EarningsStats:
+        with self._connect() as conn:
+            upgrade_spend = self._estimate_upgrade_spend(conn)
+            balance = self._balance(conn)
+            starting_balance = self._get_decimal(conn, "historical_starting_balance")
+            task_earned = self._sum_transactions(conn, "task_reward")
+            retro_earned = self._task_retro_earned(conn)
+            total_earned = parse_ap(
+                balance + upgrade_spend.total_spent - starting_balance
+            )
+            discount_gross = upgrade_spend.discount_spent
+            discount_net = parse_ap(discount_gross - Decimal("3.000"))
+            premium_and_other = parse_ap(
+                total_earned - task_earned - retro_earned - discount_net
+            )
+            return EarningsStats(
+                total_earned=total_earned,
+                starting_balance=starting_balance,
+                task_earned=task_earned,
+                retro_earned=retro_earned,
+                discount_gross=discount_gross,
+                discount_net=discount_net,
+                premium_and_other_earned=premium_and_other,
+            )
+
+    def set_upgrade_history_settings(
+        self,
+        *,
+        discount_start_base: Decimal | int | str | None = None,
+        discount_purchase_cost: Decimal | int | str | None = None,
+        historical_starting_balance: Decimal | int | str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            if discount_start_base is not None:
+                self._set_meta(
+                    conn,
+                    "discount_start_base",
+                    db_ap(discount_start_base),
+                )
+            if discount_purchase_cost is not None:
+                self._set_meta(
+                    conn,
+                    "discount_purchase_cost",
+                    db_ap(discount_purchase_cost),
+                )
+            if historical_starting_balance is not None:
+                self._set_meta(
+                    conn,
+                    "historical_starting_balance",
+                    db_ap(historical_starting_balance),
+                )
 
     def buy_cashback(self) -> UpgradeResult:
         with self._connect() as conn:
@@ -228,7 +359,7 @@ class EconomyService:
             result = self._buy_upgrade(
                 conn,
                 upgrade_type="cashback",
-                target="Кэшбек-Шина Терминала",
+                target="Скидка Терминала",
                 level_before=str(current_level),
                 level_after=str(new_level),
                 cost=Decimal("3.000"),
@@ -266,14 +397,19 @@ class EconomyService:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_tasks(self, *, limit: int = 20) -> list[dict[str, Any]]:
+    def list_tasks(
+        self, *, limit: int = 20, premium_pending: bool = False
+    ) -> list[dict[str, Any]]:
         with self._connect() as conn:
+            where = "WHERE premium_received = 0" if premium_pending else ""
             rows = conn.execute(
-                """
+                f"""
                 SELECT id, created_at, title, vector, units, base_rate,
                     vector_level, vector_multiplier, priority_multiplier,
-                    full_close_bonus, catalog_weight, reward, retro_paid_base_rate, note
+                    full_close_bonus, catalog_weight, reward, current_reward,
+                    retro_paid_base_rate, premium_received, note
                 FROM tasks
+                {where}
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -281,12 +417,37 @@ class EconomyService:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_task_premium_received(self, task_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, title, premium_received FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise EconomyError(f"Task not found: {task_id}")
+            if int(row["premium_received"]):
+                raise EconomyError(f"Premium is already received for task #{task_id}")
+            conn.execute(
+                "UPDATE tasks SET premium_received = 1 WHERE id = ?",
+                (task_id,),
+            )
+            updated = conn.execute(
+                """
+                SELECT id, created_at, title, vector, units, reward, current_reward,
+                    premium_received
+                FROM tasks
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return dict(updated)
+
     def list_upgrades(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id, created_at, upgrade_type, target, level_before,
-                    level_after, cost, cashback, note
+                    level_after, cost, cashback AS discount, note
                 FROM upgrades
                 ORDER BY id DESC
                 LIMIT ?
@@ -308,13 +469,12 @@ class EconomyService:
     ) -> UpgradeResult:
         cost = parse_ap(cost)
         cashback_level = self._get_int(conn, "cashback_level")
-        cashback = (
-            parse_ap(cost * Decimal(cashback_level) * Decimal("0.05"))
-            if cashback_eligible and cashback_level
-            else Decimal("0.000")
-        )
+        discount = self._discount(conn, cost, cashback_eligible=cashback_eligible)
+        final_cost = parse_ap(cost - discount)
         note = f"{target}: {level_before} -> {level_after}"
-        self._ensure_can_spend(conn, cost)
+        if discount:
+            note += f" со скидкой {cashback_level * 5}%"
+        self._ensure_can_spend(conn, final_cost)
         now = self._now()
         cur = conn.execute(
             """
@@ -330,39 +490,130 @@ class EconomyService:
                 target,
                 level_before,
                 level_after,
-                db_ap(cost),
-                db_ap(cashback),
+                db_ap(final_cost),
+                db_ap(discount),
                 note,
             ),
         )
         upgrade_id = int(cur.lastrowid)
         self._insert_transaction(
             conn,
-            -cost,
+            -final_cost,
             "upgrade_purchase",
             f"Покупка улучшения: {note}",
             upgrade_id=upgrade_id,
         )
-        if cashback:
-            self._insert_transaction(
-                conn,
-                cashback,
-                "cashback",
-                f"Кэшбек за улучшение: {note}",
-                upgrade_id=upgrade_id,
+        return UpgradeResult(upgrade_id, upgrade_type, target, final_cost, discount)
+
+    def _quote_core(self, conn: sqlite3.Connection) -> UpgradeQuote:
+        current_base = self._get_decimal(conn, "base_rate")
+        new_base = parse_ap(current_base + CORE_STEP)
+        full_cost = parse_ap(current_base * Decimal("8"))
+        discount = self._discount(conn, full_cost, cashback_eligible=True)
+        return UpgradeQuote(
+            target="core",
+            level_before=current_base,
+            level_after=new_base,
+            full_cost=full_cost,
+            discount=discount,
+            final_cost=parse_ap(full_cost - discount),
+        )
+
+    def _quote_vector(self, conn: sqlite3.Connection, vector: str) -> UpgradeQuote:
+        vector_info = require_vector(vector)
+        current_level = self._get_int(conn, f"vector_level:{vector_info.key}")
+        if current_level >= VECTOR_MAX_LEVEL:
+            return UpgradeQuote(
+                target=vector_info.key,
+                level_before=current_level,
+                level_after=current_level,
+                full_cost=Decimal("0.000"),
+                discount=Decimal("0.000"),
+                final_cost=Decimal("0.000"),
+                maxed=True,
             )
-        return UpgradeResult(upgrade_id, upgrade_type, target, cost, cashback)
+        new_level = current_level + 1
+        full_cost = parse_ap(Decimal(new_level) * Decimal("0.5"))
+        discount = self._discount(conn, full_cost, cashback_eligible=True)
+        return UpgradeQuote(
+            target=vector_info.key,
+            level_before=current_level,
+            level_after=new_level,
+            full_cost=full_cost,
+            discount=discount,
+            final_cost=parse_ap(full_cost - discount),
+        )
+
+    def _discount(
+        self,
+        conn: sqlite3.Connection,
+        cost: Decimal,
+        *,
+        cashback_eligible: bool,
+    ) -> Decimal:
+        cashback_level = self._get_int(conn, "cashback_level")
+        return (
+            parse_ap(cost * Decimal(cashback_level) * Decimal("0.05"))
+            if cashback_eligible and cashback_level
+            else Decimal("0.000")
+        )
+
+    def _estimate_upgrade_spend(self, conn: sqlite3.Connection) -> UpgradeSpendEstimate:
+        state = EconomyState(
+            balance=self._balance(conn),
+            base_rate=self._get_decimal(conn, "base_rate"),
+            cashback_level=self._get_int(conn, "cashback_level"),
+            retroactive_indexing_enabled=self._get_bool(
+                conn, "retroactive_indexing_enabled"
+            ),
+            vector_levels={
+                key: self._get_int(conn, f"vector_level:{key}") for key in VECTORS
+            },
+        )
+        discount_start_base = self._get_decimal(conn, "discount_start_base")
+        discount_purchase_cost = self._get_decimal(conn, "discount_purchase_cost")
+        discount_rate = Decimal(state.cashback_level) * Decimal("0.05")
+
+        core_spent = Decimal("0.000")
+        base = DEFAULT_BASE_RATE
+        while base < state.base_rate:
+            full_cost = parse_ap(base * Decimal("8"))
+            if base >= discount_start_base:
+                core_spent += parse_ap(full_cost * (Decimal("1") - discount_rate))
+            else:
+                core_spent += full_cost
+            base = parse_ap(base + CORE_STEP)
+
+        vector_spent_by_key = {}
+        for key, level in state.vector_levels.items():
+            spent = Decimal("0.000")
+            for next_level in range(1, level + 1):
+                spent += parse_ap(Decimal(next_level) * Decimal("0.5"))
+            vector_spent_by_key[key] = parse_ap(spent)
+
+        core_spent = parse_ap(core_spent)
+        vector_spent = parse_ap(sum(vector_spent_by_key.values(), Decimal("0.000")))
+        discount_spent = discount_purchase_cost if state.cashback_level else Decimal("0.000")
+        return UpgradeSpendEstimate(
+            core_spent=core_spent,
+            vector_spent=vector_spent,
+            discount_spent=discount_spent,
+            vector_spent_by_key=vector_spent_by_key,
+            total_spent=parse_ap(discount_spent + core_spent + vector_spent),
+            discount_start_base=parse_ap(discount_start_base),
+        )
 
     def _apply_retroactive_indexing(
         self, conn: sqlite3.Connection, *, exclude_task_id: int
-    ) -> Decimal:
+    ) -> list[RetroBonusDetail]:
         if not self._get_bool(conn, "retroactive_indexing_enabled"):
-            return Decimal("0.000")
+            return []
         current_base = self._get_decimal(conn, "base_rate")
         rows = conn.execute(
             """
-            SELECT id, units, vector_multiplier, priority_multiplier,
-                full_close_bonus, catalog_weight, retro_paid_base_rate
+            SELECT id, title, units, vector_multiplier, priority_multiplier,
+                full_close_bonus, catalog_weight, current_reward,
+                retro_paid_base_rate
             FROM tasks
             WHERE id != ?
             ORDER BY id ASC
@@ -370,11 +621,12 @@ class EconomyService:
             (exclude_task_id,),
         ).fetchall()
         total = Decimal("0.000")
-        changed = 0
+        details: list[RetroBonusDetail] = []
         for row in rows:
             paid_base = parse_ap(row["retro_paid_base_rate"])
             if paid_base >= current_base:
                 continue
+            previous_reward = parse_ap(row["current_reward"])
             delta = parse_ap(
                 Decimal(row["units"])
                 * (current_base - paid_base)
@@ -386,19 +638,43 @@ class EconomyService:
             if not delta:
                 continue
             total = parse_ap(total + delta)
-            changed += 1
+            updated_reward = parse_ap(previous_reward + delta)
+            details.append(
+                RetroBonusDetail(
+                    task_id=int(row["id"]),
+                    title=str(row["title"]),
+                    units=int(row["units"]),
+                    paid_base_rate=paid_base,
+                    current_base_rate=current_base,
+                    vector_multiplier=parse_ap(row["vector_multiplier"]),
+                    priority_multiplier=parse_ap(row["priority_multiplier"]),
+                    full_close_bonus=parse_ap(row["full_close_bonus"]),
+                    catalog_weight=parse_ap(row["catalog_weight"]),
+                    previous_reward=previous_reward,
+                    updated_reward=updated_reward,
+                    delta=delta,
+                )
+            )
             conn.execute(
-                "UPDATE tasks SET retro_paid_base_rate = ? WHERE id = ?",
-                (db_ap(current_base), row["id"]),
+                """
+                UPDATE tasks
+                SET retro_paid_base_rate = ?, current_reward = ?
+                WHERE id = ?
+                """,
+                (
+                    db_ap(current_base),
+                    db_ap(updated_reward),
+                    row["id"],
+                ),
             )
         if total:
             self._insert_transaction(
                 conn,
                 total,
                 "retro_bonus",
-                f"Ретроспективная индексация по задачам: {changed}",
+                f"Ретроспективная индексация по задачам: {len(details)}",
             )
-        return total
+        return details
 
     def _add_transaction(
         self,
@@ -444,6 +720,26 @@ class EconomyService:
         total = sum((parse_ap(row["amount"]) for row in rows), Decimal("0.000"))
         return parse_ap(total)
 
+    def _sum_transactions(self, conn: sqlite3.Connection, kind: str) -> Decimal:
+        rows = conn.execute(
+            "SELECT amount FROM transactions WHERE kind = ?",
+            (kind,),
+        ).fetchall()
+        total = sum((parse_ap(row["amount"]) for row in rows), Decimal("0.000"))
+        return parse_ap(total)
+
+    def _task_retro_earned(self, conn: sqlite3.Connection) -> Decimal:
+        rows = conn.execute("SELECT reward, current_reward FROM tasks").fetchall()
+        total = sum(
+            (
+                parse_ap(row["current_reward"] or row["reward"])
+                - parse_ap(row["reward"])
+                for row in rows
+            ),
+            Decimal("0.000"),
+        )
+        return parse_ap(total)
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -480,7 +776,9 @@ class EconomyService:
                 full_close_bonus TEXT NOT NULL,
                 catalog_weight TEXT NOT NULL,
                 reward TEXT NOT NULL,
+                current_reward TEXT NOT NULL,
                 retro_paid_base_rate TEXT NOT NULL,
+                premium_received INTEGER NOT NULL DEFAULT 0,
                 note TEXT NOT NULL
             );
 
@@ -497,6 +795,45 @@ class EconomyService:
             );
             """
         )
+        self._migrate_schema(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "current_reward" not in task_columns:
+            self._add_column_if_missing(
+                conn,
+                "tasks",
+                "current_reward",
+                "ALTER TABLE tasks ADD COLUMN current_reward TEXT",
+            )
+            conn.execute("UPDATE tasks SET current_reward = reward")
+        if "premium_received" not in task_columns:
+            self._add_column_if_missing(
+                conn,
+                "tasks",
+                "premium_received",
+                "ALTER TABLE tasks ADD COLUMN premium_received INTEGER NOT NULL DEFAULT 0",
+            )
+
+    def _add_column_if_missing(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        statement: str,
+    ) -> None:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            columns = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                raise
 
     def _ensure_defaults(self, conn: sqlite3.Connection) -> None:
         defaults = {
@@ -504,6 +841,9 @@ class EconomyService:
             "base_rate": db_ap(DEFAULT_BASE_RATE),
             "cashback_level": "0",
             "retroactive_indexing_enabled": "0",
+            "discount_start_base": db_ap(DEFAULT_DISCOUNT_START_BASE),
+            "discount_purchase_cost": db_ap(DEFAULT_DISCOUNT_PURCHASE_COST),
+            "historical_starting_balance": db_ap(DEFAULT_HISTORICAL_STARTING_BALANCE),
         }
         defaults.update({f"vector_level:{key}": "0" for key in VECTORS})
         for key, value in defaults.items():

@@ -41,14 +41,15 @@ class CliTests(unittest.TestCase):
 
     def test_discord_command_requires_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            db_path = Path(temp) / "balance.sqlite3"
+            temp_path = Path(temp)
+            db_path = temp_path / "balance.sqlite3"
             env = os.environ.copy()
             env["PYTHONPATH"] = str(ROOT / "src")
             env.pop("DISCORD_BOT_TOKEN", None)
 
             result = subprocess.run(
                 [sys.executable, "-m", "yellka", "--db", str(db_path), "discord"],
-                cwd=ROOT,
+                cwd=temp_path,
                 env=env,
                 text=True,
                 capture_output=True,
@@ -75,9 +76,12 @@ class CliTests(unittest.TestCase):
                 "--full-close",
             )
             tasks = self.run_cli(db_path, "tasks")
+            premium = self.run_cli(db_path, "premium", "list")
 
             self.assertIn("Задача #1", completed.stdout)
             self.assertIn("Цепь", tasks.stdout)
+            self.assertIn("current_reward", tasks.stdout)
+            self.assertIn("Цепь", premium.stdout)
 
 
 if __name__ == "__main__":

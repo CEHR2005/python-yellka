@@ -55,16 +55,77 @@ class EconomyServiceTests(unittest.TestCase):
         first_vector = service.buy_vector("code")
 
         self.assertEqual(cashback.cost, Decimal("3.000"))
-        self.assertEqual(first_core.cost, Decimal("2.000"))
-        self.assertEqual(first_core.cashback, Decimal("0.100"))
-        self.assertEqual(first_vector.cost, Decimal("0.500"))
+        self.assertEqual(first_core.cost, Decimal("1.520"))
+        self.assertEqual(first_core.cashback, Decimal("0.080"))
+        self.assertEqual(first_vector.cost, Decimal("0.475"))
         self.assertEqual(first_vector.cashback, Decimal("0.025"))
 
         state = service.get_state()
         self.assertEqual(state.base_rate, Decimal("0.250"))
         self.assertEqual(state.cashback_level, 1)
         self.assertEqual(state.vector_levels["code"], 1)
-        self.assertEqual(state.balance, Decimal("14.625"))
+        self.assertEqual(state.balance, Decimal("15.005"))
+
+    def test_vector_upgrade_quote_includes_discounted_next_price(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("20"), "Старт")
+        service.buy_cashback()
+
+        quote = service.quote_vector_upgrade("code")
+
+        self.assertEqual(quote.level_before, 0)
+        self.assertEqual(quote.level_after, 1)
+        self.assertEqual(quote.full_cost, Decimal("0.500"))
+        self.assertEqual(quote.discount, Decimal("0.025"))
+        self.assertEqual(quote.final_cost, Decimal("0.475"))
+
+    def test_core_upgrade_quote_includes_discounted_next_price(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("20"), "Старт")
+        service.buy_cashback()
+
+        quote = service.quote_core_upgrade()
+
+        self.assertEqual(quote.level_before, Decimal("0.200"))
+        self.assertEqual(quote.level_after, Decimal("0.250"))
+        self.assertEqual(quote.full_cost, Decimal("1.600"))
+        self.assertEqual(quote.discount, Decimal("0.080"))
+        self.assertEqual(quote.final_cost, Decimal("1.520"))
+
+    def test_historical_upgrade_spend_matches_spreadsheet_totals(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_meta(conn, "base_rate", "1.900")
+            service._set_meta(conn, "cashback_level", "5")
+            service._set_meta(conn, "vector_level:code", "10")
+
+        estimate = service.estimate_upgrade_spend()
+
+        # Matches the spreadsheet: C10=220.5, D13=20, E12=27.5, E13=268.
+        self.assertEqual(estimate.discount_spent, Decimal("20.000"))
+        self.assertEqual(estimate.core_spent, Decimal("220.500"))
+        self.assertEqual(estimate.vector_spent_by_key["code"], Decimal("27.500"))
+        self.assertEqual(estimate.total_spent, Decimal("268.000"))
+
+    def test_earnings_stats_derive_total_from_balance_and_historical_spend(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_meta(conn, "base_rate", "1.900")
+            service._set_meta(conn, "cashback_level", "5")
+            service._set_meta(conn, "vector_level:code", "10")
+            service._set_meta(conn, "historical_starting_balance", "24.000")
+        service.add_income(Decimal("10"), "Премия")
+        service.complete_task(title="Таск", units=2)
+
+        stats = service.get_earnings_stats()
+
+        self.assertEqual(stats.total_earned, Decimal("261.600"))
+        self.assertEqual(stats.starting_balance, Decimal("24.000"))
+        self.assertEqual(stats.task_earned, Decimal("7.600"))
+        self.assertEqual(stats.retro_earned, Decimal("0.000"))
+        self.assertEqual(stats.discount_gross, Decimal("20.000"))
+        self.assertEqual(stats.discount_net, Decimal("17.000"))
+        self.assertEqual(stats.premium_and_other_earned, Decimal("237.000"))
 
     def test_retroactive_indexing_pays_previous_task_delta_after_new_task(self) -> None:
         service = self.make_service()
@@ -77,6 +138,10 @@ class EconomyServiceTests(unittest.TestCase):
 
         self.assertEqual(original.reward, Decimal("0.800"))
         self.assertEqual(followup.reward, Decimal("0.250"))
+        self.assertEqual(followup.retro_bonus, Decimal("0.200"))
+        self.assertEqual(len(followup.retro_details), 1)
+        self.assertEqual(followup.retro_details[0].task_id, original.id)
+        self.assertEqual(followup.retro_details[0].delta, Decimal("0.200"))
 
         transactions = service.list_transactions(limit=10)
         retro = [row for row in transactions if row["kind"] == "retro_bonus"]
@@ -84,11 +149,38 @@ class EconomyServiceTests(unittest.TestCase):
         # Previous task delta: 4 units * (0.25 - 0.20).
         self.assertEqual(Decimal(retro[0]["amount"]), Decimal("0.200"))
 
+        original_task = [row for row in service.list_tasks(limit=10) if row["id"] == original.id][0]
+        self.assertEqual(Decimal(original_task["reward"]), Decimal("0.800"))
+        self.assertEqual(Decimal(original_task["current_reward"]), Decimal("1.000"))
+
+    def test_premium_queue_tracks_tasks_without_changing_original_reward(self) -> None:
+        service = self.make_service()
+        first = service.complete_task(title="Первый таск", units=2)
+        second = service.complete_task(title="Второй таск", units=1)
+
+        service.mark_task_premium_received(first.id)
+
+        pending = service.list_tasks(limit=10, premium_pending=True)
+        self.assertEqual([row["id"] for row in pending], [second.id])
+        self.assertEqual(Decimal(pending[0]["reward"]), Decimal("0.200"))
+
     def test_expenses_cannot_overdraw_by_default(self) -> None:
         service = self.make_service()
 
         with self.assertRaises(InsufficientBalanceError):
             service.add_expense(Decimal("1"), "Too much")
+
+    def test_expense_amounts_are_always_recorded_as_negative(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("20"), "Старт")
+
+        service.add_expense(Decimal("-7.2"), "Списание")
+
+        self.assertEqual(service.get_state().balance, Decimal("12.800"))
+        self.assertEqual(
+            Decimal(service.list_transactions(limit=1)[0]["amount"]),
+            Decimal("-7.200"),
+        )
 
     def test_catalog_lookup_supports_keys_and_russian_titles(self) -> None:
         by_key = find_catalog_item("chain")
