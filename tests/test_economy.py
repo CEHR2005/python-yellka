@@ -127,6 +127,68 @@ class EconomyServiceTests(unittest.TestCase):
         self.assertEqual(stats.discount_net, Decimal("17.000"))
         self.assertEqual(stats.premium_and_other_earned, Decimal("237.000"))
 
+    def test_earnings_stats_split_task_and_retro_from_task_reward_columns(self) -> None:
+        service = self.make_service()
+        now = service._now()
+        with service._connect() as conn:
+            for title, reward, current_reward in [
+                ("Историческая задача 1", "10.000", "15.000"),
+                ("Историческая задача 2", "2.500", "3.750"),
+            ]:
+                cur = conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        created_at, title, vector, units, base_rate, vector_level,
+                        vector_multiplier, priority_multiplier, full_close_bonus,
+                        catalog_weight, reward, current_reward,
+                        retro_paid_base_rate, premium_received, note
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        title,
+                        "code",
+                        1,
+                        "1.000",
+                        0,
+                        "1.000",
+                        "1.000",
+                        "1.000",
+                        "1.000",
+                        reward,
+                        current_reward,
+                        "1.000",
+                        0,
+                        "",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO transactions (
+                        created_at, amount, kind, note, task_id, upgrade_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        current_reward,
+                        "task_reward",
+                        f"Импортирована задача: {title}",
+                        cur.lastrowid,
+                        None,
+                    ),
+                )
+
+        stats = service.get_earnings_stats()
+
+        self.assertEqual(stats.total_earned, Decimal("18.750"))
+        self.assertEqual(stats.task_earned, Decimal("12.500"))
+        self.assertEqual(stats.retro_earned, Decimal("6.250"))
+        self.assertEqual(stats.discount_gross, Decimal("0.000"))
+        self.assertEqual(stats.discount_net, Decimal("0.000"))
+        self.assertEqual(stats.premium_and_other_earned, Decimal("0.000"))
+
     def test_retroactive_indexing_pays_previous_task_delta_after_new_task(self) -> None:
         service = self.make_service()
         service.add_income(Decimal("40"), "Старт")

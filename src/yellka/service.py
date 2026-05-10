@@ -17,6 +17,7 @@ PRIORITY_MULTIPLIER = Decimal("2.000")
 VECTOR_STEP = Decimal("0.100")
 VECTOR_MAX_LEVEL = 10
 CASHBACK_MAX_LEVEL = 5
+CASHBACK_PURCHASE_COST = Decimal("3.000")
 RETROACTIVE_INDEXING_COST = Decimal("25.000")
 UPDATE_BONUS = Decimal("2.500")
 DEFAULT_DISCOUNT_START_BASE = Decimal("0.800")
@@ -303,13 +304,17 @@ class EconomyService:
             upgrade_spend = self._estimate_upgrade_spend(conn)
             balance = self._balance(conn)
             starting_balance = self._get_decimal(conn, "historical_starting_balance")
-            task_earned = self._sum_transactions(conn, "task_reward")
+            task_earned = self._task_reward_earned(conn)
             retro_earned = self._task_retro_earned(conn)
             total_earned = parse_ap(
                 balance + upgrade_spend.total_spent - starting_balance
             )
             discount_gross = upgrade_spend.discount_spent
-            discount_net = parse_ap(discount_gross - Decimal("3.000"))
+            discount_net = (
+                parse_ap(discount_gross - CASHBACK_PURCHASE_COST)
+                if discount_gross
+                else Decimal("0.000")
+            )
             premium_and_other = parse_ap(
                 total_earned - task_earned - retro_earned - discount_net
             )
@@ -362,7 +367,7 @@ class EconomyService:
                 target="Скидка Терминала",
                 level_before=str(current_level),
                 level_after=str(new_level),
-                cost=Decimal("3.000"),
+                cost=CASHBACK_PURCHASE_COST,
                 cashback_eligible=False,
             )
             self._set_meta(conn, "cashback_level", str(new_level))
@@ -728,8 +733,17 @@ class EconomyService:
         total = sum((parse_ap(row["amount"]) for row in rows), Decimal("0.000"))
         return parse_ap(total)
 
+    def _task_reward_earned(self, conn: sqlite3.Connection) -> Decimal:
+        rows = conn.execute("SELECT reward FROM tasks").fetchall()
+        if not rows:
+            return self._sum_transactions(conn, "task_reward")
+        total = sum((parse_ap(row["reward"]) for row in rows), Decimal("0.000"))
+        return parse_ap(total)
+
     def _task_retro_earned(self, conn: sqlite3.Connection) -> Decimal:
         rows = conn.execute("SELECT reward, current_reward FROM tasks").fetchall()
+        if not rows:
+            return self._sum_transactions(conn, "retro_bonus")
         total = sum(
             (
                 parse_ap(row["current_reward"] or row["reward"])
