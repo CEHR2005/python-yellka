@@ -9,6 +9,8 @@ Python-бот и CLI для менеджмента баланса AP по пра
 - Поддерживает покупки из документа: `Ядро Вычислений` `+0.05 AP`, векторные множители `+10%`, скидку до 25%, `Ретроспективная Индексация`.
 - Показывает список выполненных задач и историю транзакций.
 - Для каждой задачи хранит исходную награду, текущую награду после ретро и статус получения премии.
+- Поддерживает категории задач через формат `Категория: задача`, например `ИИ врагов: поиск игрока`.
+- Позволяет отмечать категорию завершенной или снова открытой.
 - Показывает исторический заработок: задачи считаются по исходным `reward`,
   ретро — по разнице `current_reward - reward`, а остальное остается в
   премиях/прочих начислениях.
@@ -22,10 +24,14 @@ python -m yellka --db ./balance.sqlite3 earn 10 "Ручная корректир
 python -m yellka --db ./balance.sqlite3 buy cashback
 python -m yellka --db ./balance.sqlite3 buy core
 python -m yellka --db ./balance.sqlite3 complete "Цепь и возврат" --catalog chain --units 3 --vector code --full-close
+python -m yellka --db ./balance.sqlite3 complete "ИИ врагов: поиск игрока"
 python -m yellka --db ./balance.sqlite3 balance
 python -m yellka --db ./balance.sqlite3 tasks
 python -m yellka --db ./balance.sqlite3 premium list
 python -m yellka --db ./balance.sqlite3 premium mark 1
+python -m yellka --db ./balance.sqlite3 categories list
+python -m yellka --db ./balance.sqlite3 categories done "ИИ врагов"
+python -m yellka --db ./balance.sqlite3 categories open "ИИ врагов"
 python -m yellka --db ./balance.sqlite3 transactions
 ```
 
@@ -74,6 +80,9 @@ code
 !tasks
 !premium
 !premium mark <task_id>
+!categories
+!categories done <category>
+!categories open <category>
 !history
 !buy_core
 !buy_vector [code|modeling|animation|sfx|gamedesign]
@@ -89,6 +98,10 @@ code
 units * base_rate * catalog_weight * vector_multiplier * priority_multiplier * full_close_multiplier
 ```
 
+- Если название задачи записано как `Категория: задача`, бот отдельно сохранит
+  категорию и название. Это нужно для очереди премий и группировки прошлых задач.
+- Премия категории считается как `50%` от исходной стоимости задач в этой
+  категории, то есть от суммы `reward`, без ретро-пересчета `current_reward`.
 - `base_rate` начинается с `0.2 AP`.
 - `buy core` стоит `current_base * 8` с учетом купленной скидки и повышает базу на `0.05 AP`.
 - `buy vector code` повышает вектор на `+10%`; стоимость шага `new_level * 0.5 AP`, максимум `+100%`.

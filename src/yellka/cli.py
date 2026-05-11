@@ -97,6 +97,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     premium_mark.add_argument("task_id", type=int)
 
+    categories = subparsers.add_parser("categories", help="Manage task categories")
+    category_subparsers = categories.add_subparsers(
+        dest="category_command",
+        required=True,
+    )
+    category_subparsers.add_parser("list", help="Show task categories")
+    category_done = category_subparsers.add_parser(
+        "done", help="Mark a category as completed"
+    )
+    category_done.add_argument("category")
+    category_open = category_subparsers.add_parser(
+        "open", help="Mark a category as not completed"
+    )
+    category_open.add_argument("category")
+
     transactions = subparsers.add_parser("transactions", help="Show transaction log")
     transactions.add_argument("--limit", type=int, default=20)
 
@@ -109,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history_settings.add_argument("--discount-start-base")
     history_settings.add_argument("--discount-purchase-cost")
+    history_settings.add_argument("--discount-cashback")
+    history_settings.add_argument("--retro-purchase-cost")
     history_settings.add_argument("--starting-balance")
 
     catalog = subparsers.add_parser("catalog", help="Show task catalog")
@@ -185,6 +202,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 [
                     "id",
                     "created_at",
+                    "category",
                     "title",
                     "vector",
                     "units",
@@ -197,13 +215,36 @@ def main(argv: Iterable[str] | None = None) -> int:
             if args.premium_command == "list":
                 print_rows(
                     service.list_tasks(limit=args.limit, premium_pending=True),
-                    ["id", "created_at", "title", "reward", "current_reward"],
+                    ["id", "created_at", "category", "title", "reward", "current_reward"],
                 )
             elif args.premium_command == "mark":
                 task = service.mark_task_premium_received(args.task_id)
                 print(f"Премия по задаче #{task['id']} отмечена полученной")
             else:
                 parser.error(f"Unknown premium command: {args.premium_command}")
+        elif args.command == "categories":
+            if args.category_command == "list":
+                print_rows(
+                    service.list_categories(),
+                    [
+                        "category",
+                        "completed",
+                        "task_count",
+                        "premium_pending_count",
+                        "reward_formula",
+                        "reward_total",
+                        "premium_total",
+                        "premium_pending_total",
+                    ],
+                )
+            elif args.category_command == "done":
+                row = service.set_category_completed(args.category, True)
+                print(f"Категория отмечена завершенной: {row['category']}")
+            elif args.category_command == "open":
+                row = service.set_category_completed(args.category, False)
+                print(f"Категория снова открыта: {row['category']}")
+            else:
+                parser.error(f"Unknown categories command: {args.category_command}")
         elif args.command == "transactions":
             print_rows(
                 service.list_transactions(limit=args.limit),
@@ -218,6 +259,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             service.set_upgrade_history_settings(
                 discount_start_base=args.discount_start_base,
                 discount_purchase_cost=args.discount_purchase_cost,
+                historical_discount_cashback=args.discount_cashback,
+                retroactive_indexing_purchase_cost=args.retro_purchase_cost,
                 historical_starting_balance=args.starting_balance,
             )
             print(format_upgrade_spend(service))
@@ -296,9 +339,10 @@ def format_upgrade_spend(service: EconomyService) -> str:
     if not vectors:
         vectors = "0"
     return (
-        "Потрачено на ядра/векторы: "
+        "Потрачено на ядра/векторы/скидку: "
         f"{format_ap(estimate.total_spent)} AP "
-        f"(скидка {format_ap(estimate.discount_spent)}, "
+        f"(уровни скидки {format_ap(estimate.discount_spent)}, "
+        f"ретро {format_ap(estimate.retroactive_indexing_spent)}, "
         f"ядра {format_ap(estimate.core_spent)}, "
         f"векторы {format_ap(estimate.vector_spent)}: {vectors}; "
         f"скидка на ядра с базы {format_ap(estimate.discount_start_base)}, "
@@ -314,9 +358,10 @@ def format_earnings_stats(service: EconomyService) -> str:
         f"(старт {format_ap(stats.starting_balance)}, "
         f"задачи {format_ap(stats.task_earned)}, "
         f"ретро {format_ap(stats.retro_earned)}, "
-        f"скидка {format_ap(stats.discount_gross)} / "
+        f"кэшбек скидки {format_ap(stats.discount_gross)} / "
         f"чистыми {format_ap(stats.discount_net)}, "
-        f"премии/прочее {format_ap(stats.premium_and_other_earned)})"
+        f"премии {format_ap(stats.premium_earned)}, "
+        f"прочее {format_ap(stats.other_earned)})"
     )
 
 

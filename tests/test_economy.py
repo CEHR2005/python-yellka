@@ -97,21 +97,25 @@ class EconomyServiceTests(unittest.TestCase):
         with service._connect() as conn:
             service._set_meta(conn, "base_rate", "1.900")
             service._set_meta(conn, "cashback_level", "5")
+            service._set_meta(conn, "retroactive_indexing_enabled", "1")
             service._set_meta(conn, "vector_level:code", "10")
 
         estimate = service.estimate_upgrade_spend()
 
-        # Matches the spreadsheet: C10=220.5, D13=20, E12=27.5, E13=268.
-        self.assertEqual(estimate.discount_spent, Decimal("20.000"))
+        # Historical spend: core 220.5, vectors 27.5, discount levels 15, retro 20.
+        self.assertEqual(estimate.discount_spent, Decimal("15.000"))
+        self.assertEqual(estimate.discount_saved, Decimal("58.300"))
+        self.assertEqual(estimate.retroactive_indexing_spent, Decimal("20.000"))
         self.assertEqual(estimate.core_spent, Decimal("220.500"))
         self.assertEqual(estimate.vector_spent_by_key["code"], Decimal("27.500"))
-        self.assertEqual(estimate.total_spent, Decimal("268.000"))
+        self.assertEqual(estimate.total_spent, Decimal("283.000"))
 
     def test_earnings_stats_derive_total_from_balance_and_historical_spend(self) -> None:
         service = self.make_service()
         with service._connect() as conn:
             service._set_meta(conn, "base_rate", "1.900")
             service._set_meta(conn, "cashback_level", "5")
+            service._set_meta(conn, "retroactive_indexing_enabled", "1")
             service._set_meta(conn, "vector_level:code", "10")
             service._set_meta(conn, "historical_starting_balance", "24.000")
         service.add_income(Decimal("10"), "Премия")
@@ -119,13 +123,13 @@ class EconomyServiceTests(unittest.TestCase):
 
         stats = service.get_earnings_stats()
 
-        self.assertEqual(stats.total_earned, Decimal("261.600"))
+        self.assertEqual(stats.total_earned, Decimal("318.870"))
         self.assertEqual(stats.starting_balance, Decimal("24.000"))
         self.assertEqual(stats.task_earned, Decimal("7.600"))
         self.assertEqual(stats.retro_earned, Decimal("0.000"))
-        self.assertEqual(stats.discount_gross, Decimal("20.000"))
-        self.assertEqual(stats.discount_net, Decimal("17.000"))
-        self.assertEqual(stats.premium_and_other_earned, Decimal("237.000"))
+        self.assertEqual(stats.discount_gross, Decimal("18.270"))
+        self.assertEqual(stats.discount_net, Decimal("3.270"))
+        self.assertEqual(stats.premium_and_other_earned, Decimal("269.000"))
 
     def test_earnings_stats_split_task_and_retro_from_task_reward_columns(self) -> None:
         service = self.make_service()
@@ -225,6 +229,47 @@ class EconomyServiceTests(unittest.TestCase):
         pending = service.list_tasks(limit=10, premium_pending=True)
         self.assertEqual([row["id"] for row in pending], [second.id])
         self.assertEqual(Decimal(pending[0]["reward"]), Decimal("0.200"))
+
+    def test_task_title_can_include_category_prefix(self) -> None:
+        service = self.make_service()
+
+        task = service.complete_task(title="ИИ врагов: поиск игрока", units=1)
+
+        row = service.list_tasks(limit=1)[0]
+        self.assertEqual(row["id"], task.id)
+        self.assertEqual(row["category"], "ИИ врагов")
+        self.assertEqual(row["title"], "поиск игрока")
+
+    def test_categories_can_be_marked_completed(self) -> None:
+        service = self.make_service()
+        service.complete_task(title="ИИ врагов: поиск игрока", units=1)
+        service.complete_task(title="ИИ врагов: движение к игроку", units=1)
+
+        updated = service.set_category_completed("ИИ врагов", True)
+        categories = service.list_categories()
+
+        self.assertEqual(updated["category"], "ИИ врагов")
+        self.assertEqual(int(updated["completed"]), 1)
+        self.assertEqual(len(categories), 1)
+        self.assertEqual(categories[0]["category"], "ИИ врагов")
+        self.assertEqual(int(categories[0]["completed"]), 1)
+        self.assertEqual(int(categories[0]["task_count"]), 2)
+        self.assertEqual(int(categories[0]["premium_pending_count"]), 2)
+        self.assertEqual(categories[0]["reward_total"], Decimal("0.400"))
+        self.assertEqual(categories[0]["reward_formula"], "0.2x2 = 0.4")
+        self.assertEqual(categories[0]["premium_total"], Decimal("0.200"))
+        self.assertEqual(categories[0]["premium_pending_total"], Decimal("0.200"))
+
+    def test_category_premium_is_half_of_total_original_reward(self) -> None:
+        service = self.make_service()
+        service.complete_task(title="ИИ врагов: поиск игрока", catalog_value="0.770")
+        service.complete_task(title="ИИ врагов: специальные атаки", catalog_value="0.825")
+
+        category = service.list_categories()[0]
+
+        self.assertEqual(category["reward_total"], Decimal("0.319"))
+        self.assertEqual(category["reward_formula"], "0.154 + 0.165 = 0.319")
+        self.assertEqual(category["premium_total"], Decimal("0.160"))
 
     def test_expenses_cannot_overdraw_by_default(self) -> None:
         service = self.make_service()

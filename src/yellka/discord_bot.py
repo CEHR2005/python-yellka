@@ -461,6 +461,17 @@ class DiscordCommandHandler:
             if not rows:
                 return "Нет задач без премии"
             return "\n".join(self._task_line(row) for row in rows)
+        if command == "categories":
+            if len(args) > 2 and args[1] in {"done", "open"}:
+                completed = args[1] == "done"
+                row = self.service.set_category_completed(" ".join(args[2:]), completed)
+                self.last_message_changed_state = True
+                status = "завершена" if completed else "открыта"
+                return f"Категория {status}: {row['category']}"
+            rows = self.service.list_categories()
+            if not rows:
+                return "Нет категорий"
+            return "\n".join(self._category_line(row) for row in rows)
         if command == "history":
             rows = self.service.list_transactions(limit=10)
             if not rows:
@@ -510,7 +521,8 @@ class DiscordCommandHandler:
             vectors = "0"
         return (
             f"{format_ap(estimate.total_spent)} AP "
-            f"(скидка {format_ap(estimate.discount_spent)}, "
+            f"(уровни скидки {format_ap(estimate.discount_spent)}, "
+            f"ретро {format_ap(estimate.retroactive_indexing_spent)}, "
             f"ядра {format_ap(estimate.core_spent)}, "
             f"векторы {format_ap(estimate.vector_spent)}: {vectors}; "
             f"скидка на ядра с базы {format_ap(estimate.discount_start_base)}, "
@@ -524,9 +536,10 @@ class DiscordCommandHandler:
             f"(старт {format_ap(stats.starting_balance)}, "
             f"задачи {format_ap(stats.task_earned)}, "
             f"ретро {format_ap(stats.retro_earned)}, "
-            f"скидка {format_ap(stats.discount_gross)} / "
+            f"кэшбек скидки {format_ap(stats.discount_gross)} / "
             f"чистыми {format_ap(stats.discount_net)}, "
-            f"премии/прочее {format_ap(stats.premium_and_other_earned)})"
+            f"премии {format_ap(stats.premium_earned)}, "
+            f"прочее {format_ap(stats.other_earned)})"
         )
 
     def _upgrade_line(self, result) -> str:
@@ -543,10 +556,24 @@ class DiscordCommandHandler:
 
     def _task_line(self, row: dict[str, Any]) -> str:
         premium = "премия получена" if int(row["premium_received"]) else "без премии"
+        task_name = row["title"]
+        if row.get("category"):
+            task_name = f"{row['category']}: {task_name}"
         return (
             f"#{row['id']} +{format_ap(row['reward'])} AP"
             f" / ретро {format_ap(row['current_reward'])} AP"
-            f" [{premium}] {row['title']}"
+            f" [{premium}] {task_name}"
+        )
+
+    def _category_line(self, row: dict[str, Any]) -> str:
+        status = "закрыта" if int(row["completed"]) else "открыта"
+        return (
+            f"{row['category']}: {status}, "
+            f"задач {row['task_count']}, "
+            f"без премии {row['premium_pending_count']}, "
+            f"исходно {row['reward_formula']} AP, "
+            f"премия {format_ap(row['premium_total'])} AP "
+            f"(к получению {format_ap(row['premium_pending_total'])})"
         )
 
     def _help(self) -> str:
@@ -563,6 +590,9 @@ def help_text(command_prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 {command_prefix}vectors
 {command_prefix}premium
 {command_prefix}premium mark <task_id>
+{command_prefix}categories
+{command_prefix}categories done <category>
+{command_prefix}categories open <category>
 {command_prefix}history
 {command_prefix}buy_core
 {command_prefix}buy_vector [code|modeling|animation|sfx|gamedesign]
