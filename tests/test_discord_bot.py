@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from yellka.discord_bot import DiscordCommandHandler
+from yellka.discord_bot import DiscordCommandHandler, is_task_result_response
 from yellka.service import EconomyService
 
 
@@ -81,6 +81,25 @@ class DiscordCommandHandlerTests(unittest.TestCase):
         self.assertEqual(marked, "Премия по задаче #1 отмечена полученной")
         self.assertEqual(empty, "Нет задач без премии")
 
+    def test_category_done_awards_pending_premium(self) -> None:
+        handler = self.make_handler()
+        handler.handle_message('!complete "Модификаторы силы: рывок"')
+        handler.handle_message('!complete "Модификаторы силы: удар"')
+
+        done = handler.handle_message("!categories done Модификаторы силы")
+        repeated = handler.handle_message("!categories done Модификаторы силы")
+        balance = handler.handle_message("!balance")
+
+        self.assertIsNotNone(done)
+        self.assertIn("Категория завершена: Модификаторы силы", done)
+        self.assertIn("Премия: +0.2 AP", done)
+        self.assertEqual(
+            repeated,
+            "Категория завершена: Модификаторы силы\nНовых премий нет",
+        )
+        self.assertIsNotNone(balance)
+        self.assertIn("Баланс: 0.6 AP", balance)
+
     def test_vectors_command_shows_next_upgrade_prices(self) -> None:
         handler = self.make_handler()
         handler.handle_message("!earn 20")
@@ -107,6 +126,10 @@ class DiscordCommandHandlerTests(unittest.TestCase):
         self.assertIn("Базовая разница: 0.25 - 0.2 = 0.05 AP", response)
         self.assertIn("Формула: `4 * 0.05 * 1 = 0.2`", response)
         self.assertIn("Итого начислено: 0.45 AP", response)
+
+    def test_task_result_response_detection(self) -> None:
+        self.assertTrue(is_task_result_response("Задача #12: +0.2 AP"))
+        self.assertFalse(is_task_result_response("Баланс: 3 AP"))
 
 
 if __name__ == "__main__":

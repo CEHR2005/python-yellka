@@ -21,6 +21,10 @@ from .service import (
 DEFAULT_COMMAND_PREFIX = "!"
 
 
+def is_task_result_response(response: str) -> bool:
+    return response.startswith("Задача #")
+
+
 def run_discord_bot(
     token: str | None,
     db_path: Path,
@@ -143,6 +147,35 @@ def create_discord_client(
         except discord.HTTPException:
             terminal_messages.pop(channel.id, None)
             await send_terminal(channel)
+
+    class TaskResultActionView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @discord.ui.button(label="Задача", style=discord.ButtonStyle.success)
+        async def complete_button(self, interaction: Any, button: Any) -> None:
+            prompt = handler.start_prompt(
+                "complete",
+                interaction.user.id,
+                interaction.channel_id,
+            )
+            await interaction.response.send_message(prompt, ephemeral=True)
+
+        @discord.ui.button(label="Ядро", style=discord.ButtonStyle.secondary)
+        async def core_button(self, interaction: Any, button: Any) -> None:
+            await interaction.response.send_message(
+                handler.handle_message(f"{command_prefix}buy_core") or "Готово",
+                ephemeral=True,
+            )
+            await refresh_terminal(interaction.channel)
+
+        @discord.ui.button(label="Старт", style=discord.ButtonStyle.primary)
+        async def start_button(self, interaction: Any, button: Any) -> None:
+            await interaction.response.send_message(
+                "Открываю старт-меню.",
+                ephemeral=True,
+            )
+            await send_terminal(interaction.channel)
 
     class YellkaControlView(discord.ui.View):
         def __init__(self):
@@ -267,7 +300,8 @@ def create_discord_client(
             )
             if response is None:
                 return
-            await message.channel.send(response)
+            view = TaskResultActionView() if is_task_result_response(response) else None
+            await message.channel.send(response, view=view)
             if handler.last_message_changed_state:
                 await refresh_terminal(message.channel)
 
@@ -467,6 +501,15 @@ class DiscordCommandHandler:
                 row = self.service.set_category_completed(" ".join(args[2:]), completed)
                 self.last_message_changed_state = True
                 status = "завершена" if completed else "открыта"
+                if completed:
+                    premium = row["premium_awarded"]
+                    if premium:
+                        return (
+                            f"Категория {status}: {row['category']}\n"
+                            f"Премия: +{format_ap(premium)} AP "
+                            f"за задач: {row['premium_task_count']}"
+                        )
+                    return f"Категория {status}: {row['category']}\nНовых премий нет"
                 return f"Категория {status}: {row['category']}"
             rows = self.service.list_categories()
             if not rows:

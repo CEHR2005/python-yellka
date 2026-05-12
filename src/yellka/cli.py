@@ -239,7 +239,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                 )
             elif args.category_command == "done":
                 row = service.set_category_completed(args.category, True)
-                print(f"Категория отмечена завершенной: {row['category']}")
+                premium = row["premium_awarded"]
+                if premium:
+                    print(
+                        f"Категория отмечена завершенной: {row['category']} "
+                        f"| премия +{format_ap(premium)} AP "
+                        f"за задач: {row['premium_task_count']}"
+                    )
+                    print_state(service)
+                else:
+                    print(
+                        f"Категория отмечена завершенной: {row['category']} "
+                        "| новых премий нет"
+                    )
             elif args.category_command == "open":
                 row = service.set_category_completed(args.category, False)
                 print(f"Категория снова открыта: {row['category']}")

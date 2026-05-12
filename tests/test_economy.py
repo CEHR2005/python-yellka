@@ -246,19 +246,25 @@ class EconomyServiceTests(unittest.TestCase):
         service.complete_task(title="ИИ врагов: движение к игроку", units=1)
 
         updated = service.set_category_completed("ИИ врагов", True)
+        repeated = service.set_category_completed("ИИ врагов", True)
         categories = service.list_categories()
 
         self.assertEqual(updated["category"], "ИИ врагов")
         self.assertEqual(int(updated["completed"]), 1)
+        self.assertEqual(updated["premium_awarded"], Decimal("0.200"))
+        self.assertEqual(updated["premium_task_count"], 2)
+        self.assertEqual(repeated["premium_awarded"], Decimal("0.000"))
+        self.assertEqual(repeated["premium_task_count"], 0)
+        self.assertEqual(service.get_state().balance, Decimal("0.600"))
         self.assertEqual(len(categories), 1)
         self.assertEqual(categories[0]["category"], "ИИ врагов")
         self.assertEqual(int(categories[0]["completed"]), 1)
         self.assertEqual(int(categories[0]["task_count"]), 2)
-        self.assertEqual(int(categories[0]["premium_pending_count"]), 2)
+        self.assertEqual(int(categories[0]["premium_pending_count"]), 0)
         self.assertEqual(categories[0]["reward_total"], Decimal("0.400"))
         self.assertEqual(categories[0]["reward_formula"], "0.2x2 = 0.4")
         self.assertEqual(categories[0]["premium_total"], Decimal("0.200"))
-        self.assertEqual(categories[0]["premium_pending_total"], Decimal("0.200"))
+        self.assertEqual(categories[0]["premium_pending_total"], Decimal("0.000"))
 
     def test_category_premium_is_half_of_total_original_reward(self) -> None:
         service = self.make_service()

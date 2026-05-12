@@ -538,12 +538,40 @@ class EconomyService:
         if not category:
             raise ValueError("category must not be empty")
         with self._connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM tasks WHERE category = ? LIMIT 1",
+            task_rows = conn.execute(
+                "SELECT id, reward, premium_received FROM tasks WHERE category = ?",
                 (category,),
-            ).fetchone()
-            if exists is None:
+            ).fetchall()
+            if not task_rows:
                 raise EconomyError(f"Category not found: {category}")
+            premium_awarded = Decimal("0.000")
+            premium_task_count = 0
+            if completed:
+                pending_rows = [
+                    row for row in task_rows if not int(row["premium_received"])
+                ]
+                premium_task_count = len(pending_rows)
+                pending_reward = sum(
+                    (parse_ap(row["reward"]) for row in pending_rows),
+                    Decimal("0.000"),
+                )
+                premium_awarded = parse_ap(pending_reward * Decimal("0.5"))
+                if premium_awarded:
+                    self._insert_transaction(
+                        conn,
+                        premium_awarded,
+                        "category_premium",
+                        f"Премия за категорию: {category}",
+                    )
+                if pending_rows:
+                    conn.execute(
+                        """
+                        UPDATE tasks
+                        SET premium_received = 1
+                        WHERE category = ? AND premium_received = 0
+                        """,
+                        (category,),
+                    )
             conn.execute(
                 """
                 INSERT INTO task_categories (category, completed)
@@ -560,7 +588,10 @@ class EconomyService:
                 """,
                 (category,),
             ).fetchone()
-        return dict(row)
+            result = dict(row)
+            result["premium_awarded"] = premium_awarded
+            result["premium_task_count"] = premium_task_count
+            return result
 
     def list_upgrades(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as conn:
