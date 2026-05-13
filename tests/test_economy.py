@@ -55,8 +55,8 @@ class EconomyServiceTests(unittest.TestCase):
         first_vector = service.buy_vector("code")
 
         self.assertEqual(cashback.cost, Decimal("3.000"))
-        self.assertEqual(first_core.cost, Decimal("1.520"))
-        self.assertEqual(first_core.cashback, Decimal("0.080"))
+        self.assertEqual(first_core.cost, Decimal("1.900"))
+        self.assertEqual(first_core.cashback, Decimal("0.100"))
         self.assertEqual(first_vector.cost, Decimal("0.475"))
         self.assertEqual(first_vector.cashback, Decimal("0.025"))
 
@@ -64,7 +64,7 @@ class EconomyServiceTests(unittest.TestCase):
         self.assertEqual(state.base_rate, Decimal("0.250"))
         self.assertEqual(state.cashback_level, 1)
         self.assertEqual(state.vector_levels["code"], 1)
-        self.assertEqual(state.balance, Decimal("15.005"))
+        self.assertEqual(state.balance, Decimal("14.625"))
 
     def test_vector_upgrade_quote_includes_discounted_next_price(self) -> None:
         service = self.make_service()
@@ -88,9 +88,9 @@ class EconomyServiceTests(unittest.TestCase):
 
         self.assertEqual(quote.level_before, Decimal("0.200"))
         self.assertEqual(quote.level_after, Decimal("0.250"))
-        self.assertEqual(quote.full_cost, Decimal("1.600"))
-        self.assertEqual(quote.discount, Decimal("0.080"))
-        self.assertEqual(quote.final_cost, Decimal("1.520"))
+        self.assertEqual(quote.full_cost, Decimal("2.000"))
+        self.assertEqual(quote.discount, Decimal("0.100"))
+        self.assertEqual(quote.final_cost, Decimal("1.900"))
 
     def test_historical_upgrade_spend_matches_spreadsheet_totals(self) -> None:
         service = self.make_service()
@@ -102,13 +102,13 @@ class EconomyServiceTests(unittest.TestCase):
 
         estimate = service.estimate_upgrade_spend()
 
-        # Historical spend: core 220.5, vectors 27.5, discount levels 15, retro 20.
-        self.assertEqual(estimate.discount_spent, Decimal("15.000"))
-        self.assertEqual(estimate.discount_saved, Decimal("58.300"))
+        # Shop 3.0 spend: core cost uses current_base * 10, cashback levels cost 3+i.
+        self.assertEqual(estimate.discount_spent, Decimal("25.000"))
+        self.assertEqual(estimate.discount_saved, Decimal("72.875"))
         self.assertEqual(estimate.retroactive_indexing_spent, Decimal("20.000"))
-        self.assertEqual(estimate.core_spent, Decimal("220.500"))
+        self.assertEqual(estimate.core_spent, Decimal("275.625"))
         self.assertEqual(estimate.vector_spent_by_key["code"], Decimal("27.500"))
-        self.assertEqual(estimate.total_spent, Decimal("283.000"))
+        self.assertEqual(estimate.total_spent, Decimal("348.125"))
 
     def test_earnings_stats_derive_total_from_balance_and_historical_spend(self) -> None:
         service = self.make_service()
@@ -123,13 +123,13 @@ class EconomyServiceTests(unittest.TestCase):
 
         stats = service.get_earnings_stats()
 
-        self.assertEqual(stats.total_earned, Decimal("318.870"))
+        self.assertEqual(stats.total_earned, Decimal("383.995"))
         self.assertEqual(stats.starting_balance, Decimal("24.000"))
         self.assertEqual(stats.task_earned, Decimal("7.600"))
         self.assertEqual(stats.retro_earned, Decimal("0.000"))
         self.assertEqual(stats.discount_gross, Decimal("18.270"))
-        self.assertEqual(stats.discount_net, Decimal("3.270"))
-        self.assertEqual(stats.premium_and_other_earned, Decimal("269.000"))
+        self.assertEqual(stats.discount_net, Decimal("-6.730"))
+        self.assertEqual(stats.premium_and_other_earned, Decimal("334.125"))
 
     def test_earnings_stats_split_task_and_retro_from_task_reward_columns(self) -> None:
         service = self.make_service()
@@ -195,29 +195,62 @@ class EconomyServiceTests(unittest.TestCase):
 
     def test_retroactive_indexing_pays_previous_task_delta_after_new_task(self) -> None:
         service = self.make_service()
-        service.add_income(Decimal("40"), "Старт")
-        original = service.complete_task(title="Первый таск", vector="code", units=4)
-
-        service.buy_retroactive_indexing()
+        service.add_income(Decimal("60"), "Старт")
+        original = service.complete_task(title="Первый таск", vector="code", units=40)
         service.buy_core()
+        retro = service.buy_retroactive_indexing()
         followup = service.complete_task(title="Новый таск", vector="code", units=1)
 
-        self.assertEqual(original.reward, Decimal("0.800"))
+        self.assertEqual(original.reward, Decimal("8.000"))
+        self.assertEqual(retro.cost, Decimal("1.000"))
+        self.assertEqual(retro.cashback, Decimal("1.000"))
         self.assertEqual(followup.reward, Decimal("0.250"))
-        self.assertEqual(followup.retro_bonus, Decimal("0.200"))
-        self.assertEqual(len(followup.retro_details), 1)
-        self.assertEqual(followup.retro_details[0].task_id, original.id)
-        self.assertEqual(followup.retro_details[0].delta, Decimal("0.200"))
+        self.assertEqual(followup.retro_bonus, Decimal("0.000"))
+        self.assertEqual(len(followup.retro_details), 0)
 
         transactions = service.list_transactions(limit=10)
         retro = [row for row in transactions if row["kind"] == "retro_bonus"]
         self.assertEqual(len(retro), 1)
-        # Previous task delta: 4 units * (0.25 - 0.20).
-        self.assertEqual(Decimal(retro[0]["amount"]), Decimal("0.200"))
+        # Previous task delta: 40 units * (0.25 - 0.20), minus the 1 AP buffer fee.
+        self.assertEqual(Decimal(retro[0]["amount"]), Decimal("1.000"))
 
         original_task = [row for row in service.list_tasks(limit=10) if row["id"] == original.id][0]
-        self.assertEqual(Decimal(original_task["reward"]), Decimal("0.800"))
-        self.assertEqual(Decimal(original_task["current_reward"]), Decimal("1.000"))
+        self.assertEqual(Decimal(original_task["reward"]), Decimal("8.000"))
+        self.assertEqual(Decimal(original_task["current_reward"]), Decimal("10.000"))
+
+    def test_shop_quote_and_purchase_record_history(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("20"), "Старт")
+
+        quote = service.quote_shop_purchase("terminal.core")
+        purchase = service.buy_shop_item("terminal.core", note="Shop UI")
+
+        self.assertEqual(quote["full_cost"], "2.000")
+        self.assertEqual(purchase["item_key"], "terminal.core")
+        self.assertEqual(purchase["final_cost"], "2.000")
+        self.assertEqual(service.get_state().base_rate, Decimal("0.250"))
+        self.assertEqual(service.get_wallet()["currencies"]["ap"], "18.000")
+
+    def test_noctur_shard_purchase_and_prime_purchase_use_new_wallets(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("12"), "Старт")
+        with service._connect() as conn:
+            service._insert_transaction(
+                conn,
+                Decimal("4"),
+                "seed_shards",
+                "Shard seed",
+                currency="singularity_shard",
+            )
+
+        noctur = service.buy_shop_item("noctur.core_rewrite")
+        prime = service.buy_shop_item("prime.subscription")
+
+        self.assertEqual(noctur["currency"], "singularity_shard")
+        self.assertEqual(prime["final_cost"], "10.000")
+        wallet = service.get_wallet()["currencies"]
+        self.assertEqual(wallet["singularity_shard"], "0.000")
+        self.assertEqual(wallet["ap"], "2.000")
 
     def test_premium_queue_tracks_tasks_without_changing_original_reward(self) -> None:
         service = self.make_service()

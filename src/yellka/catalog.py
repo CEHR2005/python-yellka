@@ -25,7 +25,10 @@ VECTORS: dict[str, Vector] = {
     "animation": Vector("animation", "Анимация/Риг"),
     "sfx": Vector("sfx", "SFX/Звук"),
     "gamedesign": Vector("gamedesign", "Геймдизайн/Логика"),
+    "media": Vector("media", "Медиа/SMM"),
 }
+
+UPGRADABLE_VECTORS = tuple(key for key in VECTORS if key != "media")
 
 
 CATALOG_ITEMS: tuple[CatalogItem, ...] = (

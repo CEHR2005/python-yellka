@@ -112,20 +112,20 @@ class DiscordCommandHandlerTests(unittest.TestCase):
 
     def test_task_result_includes_retro_breakdown(self) -> None:
         handler = self.make_handler()
-        handler.handle_message("!earn 40")
-        handler.handle_message("!complete Старый 4")
-        handler.handle_message("!buy_retro")
+        handler.handle_message("!earn 60")
+        handler.handle_message("!complete Старый 40")
         handler.handle_message("!buy_core")
+        retro = handler.handle_message("!buy_retro")
 
         response = handler.handle_message("!complete Новый")
 
+        self.assertIsNotNone(retro)
+        self.assertIn("Улучшение #2", retro)
+        self.assertIn("Баланс: 67 AP", retro)
         self.assertIsNotNone(response)
         self.assertIn("Задача #2", response)
-        self.assertIn("Ретро: +0.2 AP", response)
-        self.assertIn("Задач: 1 | units: 4", response)
-        self.assertIn("Базовая разница: 0.25 - 0.2 = 0.05 AP", response)
-        self.assertIn("Формула: `4 * 0.05 * 1 = 0.2`", response)
-        self.assertIn("Итого начислено: 0.45 AP", response)
+        self.assertNotIn("Ретро:", response)
+        self.assertIn("Итого начислено: 0.25 AP", response)
 
     def test_task_result_response_detection(self) -> None:
         self.assertTrue(is_task_result_response("Задача #12: +0.2 AP"))
