@@ -110,6 +110,40 @@ class DiscordCommandHandlerTests(unittest.TestCase):
         self.assertIsNotNone(response)
         self.assertIn("code: +0% -> +10% | 0.475 AP", response)
 
+    def test_graph_command_shows_earned_ap_sparkline(self) -> None:
+        handler = self.make_handler()
+        handler.handle_message("!complete Первый 2")
+        handler.handle_message("!complete Второй 1")
+
+        response = handler.handle_message("!earnings_graph")
+
+        self.assertIsNotNone(response)
+        self.assertIn("**Суммарно заработанные AP**", response)
+        self.assertIn("0.6 AP", response)
+        self.assertIn("Событий: 2", response)
+
+    def test_roi_command_ranks_upgrade_efficiency(self) -> None:
+        handler = self.make_handler()
+
+        response = handler.handle_message("!roi")
+
+        self.assertIsNotNone(response)
+        self.assertIn("**Эффективность апгрейдов**", response)
+        self.assertIn("будущая `code` задача", response)
+        self.assertIn("шаг ядра +0.05 AP", response)
+        self.assertIn("Вектор code", response)
+        self.assertIn("0.04 AP/AP", response)
+        self.assertIn("Ядро", response)
+
+    def test_roi_command_accepts_vector_argument(self) -> None:
+        handler = self.make_handler()
+
+        response = handler.handle_message("!roi modeling")
+
+        self.assertIsNotNone(response)
+        self.assertIn("будущая `modeling` задача", response)
+        self.assertIn("Вектор modeling", response)
+
     def test_task_result_includes_retro_breakdown(self) -> None:
         handler = self.make_handler()
         handler.handle_message("!earn 60")

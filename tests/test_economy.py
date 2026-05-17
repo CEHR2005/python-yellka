@@ -731,6 +731,80 @@ class EconomyServiceTests(unittest.TestCase):
         self.assertEqual(category["reward_formula"], "0.154 + 0.165 = 0.319")
         self.assertEqual(category["premium_total"], Decimal("0.160"))
 
+    def test_reading_aura_adds_to_category_premium_rate(self) -> None:
+        service = self.make_service()
+        service.create_cabin(
+            name="Тай Ли",
+            rank="SR",
+            dominants=[{"name": "Чтение Ауры", "level": 4}],
+        )
+        service.complete_task(title="ИИ врагов: поиск игрока", units=1)
+        service.complete_task(title="ИИ врагов: движение к игроку", units=1)
+
+        category = service.list_categories()[0]
+        updated = service.set_category_completed("ИИ врагов", True)
+
+        self.assertEqual(category["premium_rate"], Decimal("0.550"))
+        self.assertEqual(category["premium_bonus_rate"], Decimal("0.050"))
+        self.assertEqual(category["premium_total"], Decimal("0.220"))
+        self.assertEqual(updated["premium_awarded"], Decimal("0.220"))
+        self.assertEqual(updated["premium_rate"], Decimal("0.550"))
+        self.assertEqual(updated["premium_bonus_details"][0]["trait"], "Чтение Ауры")
+
+    def test_earned_ap_timeline_tracks_positive_ap_transactions(self) -> None:
+        service = self.make_service()
+        service.complete_task(title="Первый", units=2)
+        service.add_expense("0.1", "Tax")
+        service.complete_task(title="Второй", units=1)
+
+        timeline = service.earned_ap_timeline()
+
+        self.assertEqual(timeline["total"], "0.600")
+        self.assertEqual([point["cumulative"] for point in timeline["points"]], ["0.400", "0.600"])
+
+    def test_upgrade_efficiency_compares_core_and_selected_vector_impact(self) -> None:
+        service = self.make_service()
+
+        report = service.quote_upgrade_efficiency()
+
+        self.assertEqual(report["vector"], "code")
+        self.assertEqual(report["units"], 1)
+        self.assertEqual(report["base_rate"], "0.200")
+        self.assertEqual(report["vector_multiplier"], "1.000")
+        self.assertEqual(report["core_step"], "0.050")
+        code = next(entry for entry in report["entries"] if entry["target"] == "code")
+        core = next(entry for entry in report["entries"] if entry["kind"] == "core")
+        self.assertEqual(code["impact"], "0.020")
+        self.assertEqual(code["cost"], "0.500")
+        self.assertEqual(code["impact_per_ap"], "0.040")
+        self.assertEqual(core["impact"], "0.050")
+        self.assertEqual(core["cost"], "2.000")
+        self.assertEqual(core["impact_per_ap"], "0.025")
+
+    def test_upgrade_efficiency_can_switch_vector(self) -> None:
+        service = self.make_service()
+
+        report = service.quote_upgrade_efficiency("modeling")
+
+        self.assertEqual(report["vector"], "modeling")
+        self.assertEqual(
+            [entry["target"] for entry in report["entries"]],
+            ["modeling", "Ядро"],
+        )
+
+    def test_upgrade_efficiency_uses_actual_core_step(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_shop_level(conn, "noctur.core_rewrite", 1)
+            service._set_meta(conn, "vector_level:code", "10")
+
+        report = service.quote_upgrade_efficiency("code")
+
+        core = next(entry for entry in report["entries"] if entry["kind"] == "core")
+        self.assertEqual(report["core_step"], "0.100")
+        self.assertEqual(report["vector_multiplier"], "2.000")
+        self.assertEqual(core["impact"], "0.200")
+
     def test_expenses_cannot_overdraw_by_default(self) -> None:
         service = self.make_service()
 

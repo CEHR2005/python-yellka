@@ -62,6 +62,7 @@ export VITE_YELLKA_WEB_TOKEN="$YELLKA_WEB_TOKEN"
 
 api_pid=""
 web_pid=""
+discord_pid=""
 cleanup_done=0
 
 cleanup() {
@@ -69,31 +70,26 @@ cleanup() {
     return
   fi
   cleanup_done=1
-  stop_process_tree "$web_pid"
-  stop_process_tree "$api_pid"
+  stop_process_group "$web_pid"
+  stop_process_group "$discord_pid"
+  stop_process_group "$api_pid"
 }
 
-stop_process_tree() {
+stop_process_group() {
   local pid="${1:-}"
-  local child
   local attempt
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     return
   fi
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    stop_process_tree "$child"
-  done
-  kill -TERM "$pid" 2>/dev/null || true
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   for attempt in {1..20}; do
     if ! kill -0 "$pid" 2>/dev/null; then
       return
     fi
     sleep 0.1
   done
-  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
-    stop_process_tree "$child"
-  done
-  kill -KILL "$pid" 2>/dev/null || true
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
 }
 
 trap cleanup EXIT
@@ -105,6 +101,11 @@ echo "API:      http://$YELLKA_WEB_HOST:$YELLKA_WEB_PORT"
 echo "Frontend: http://$VITE_HOST:$VITE_PORT"
 echo "DB:       $YELLKA_DB"
 echo "Token:    $YELLKA_WEB_TOKEN"
+if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+  echo "Discord:  command bot enabled"
+else
+  echo "Discord:  command bot disabled (DISCORD_BOT_TOKEN is empty)"
+fi
 echo
 
 if [ ! -d "$WEB_DIR/node_modules" ]; then
@@ -112,7 +113,7 @@ if [ ! -d "$WEB_DIR/node_modules" ]; then
   exit 1
 fi
 
-"$PYTHON_BIN" -m yellka.web_api &
+setsid "$PYTHON_BIN" -m yellka.web_api &
 api_pid="$!"
 
 "$PYTHON_BIN" - "$YELLKA_WEB_HOST" "$YELLKA_WEB_PORT" <<'PY'
@@ -136,10 +137,15 @@ raise SystemExit("API did not become ready in time")
 PY
 
 cd "$WEB_DIR"
-npm run dev -- --host "$VITE_HOST" --port "$VITE_PORT" --strictPort &
+setsid npm run dev -- --host "$VITE_HOST" --port "$VITE_PORT" --strictPort &
 web_pid="$!"
 
-wait -n "$api_pid" "$web_pid"
+if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+  setsid "$PYTHON_BIN" -m yellka --db "$YELLKA_DB" discord &
+  discord_pid="$!"
+fi
+
+wait -n "$api_pid" "$web_pid" ${discord_pid:+"$discord_pid"}
 status="$?"
 cleanup
 exit "$status"

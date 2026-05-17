@@ -438,6 +438,11 @@ class DiscordCommandHandler:
             )
         if command == "vectors":
             return self.vector_prices_text()
+        if command in {"earnings_graph", "graph", "график"}:
+            return self.earnings_graph_text()
+        if command in {"roi", "efficiency", "эффективность"}:
+            vector = args[1] if len(args) > 1 else "code"
+            return self.upgrade_efficiency_text(vector)
         if command == "earn":
             amount, note = self._amount_note(args)
             self.service.add_income(amount, note)
@@ -603,6 +608,57 @@ class DiscordCommandHandler:
             f"прочее {format_ap(stats.other_earned)})"
         )
 
+    def earnings_graph_text(self) -> str:
+        timeline = self.service.earned_ap_timeline(limit=48)
+        points = timeline["points"]
+        if not points:
+            return "Нет положительных AP-транзакций для графика"
+        values = [Decimal(str(point["cumulative"])) for point in points]
+        sparkline = sparkline_text(values, width=32)
+        first = points[0]
+        last = points[-1]
+        return "\n".join(
+            [
+                "**Суммарно заработанные AP**",
+                f"`0 AP {sparkline} {format_ap(timeline['total'])} AP`",
+                (
+                    f"Событий: {timeline['event_count']} | "
+                    f"Период: #{first['id']} -> #{last['id']}"
+                ),
+                f"Последнее: +{format_ap(last['amount'])} AP ({last['kind']})",
+            ]
+        )
+
+    def upgrade_efficiency_text(self, vector: str = "code") -> str:
+        report = self.service.quote_upgrade_efficiency(vector)
+        entries = report["entries"]
+        if not entries:
+            return "Нет вариантов улучшений для оценки"
+        lines = [
+            "**Эффективность апгрейдов**",
+            (
+                f"Модель: будущая `{report['vector']}` задача "
+                f"1u, вес x{format_ap(report['catalog_weight'])}, "
+                f"без priority/full-close."
+            ),
+            (
+                f"Текущие множители: база {format_ap(report['base_rate'])} AP, "
+                f"вектор x{format_ap(report['vector_multiplier'])}, "
+                f"шаг ядра +{format_ap(report['core_step'])} AP."
+            ),
+        ]
+        for index, entry in enumerate(entries, start=1):
+            label = "Ядро" if entry["kind"] == "core" else f"Вектор {entry['target']}"
+            if entry["maxed"]:
+                lines.append(f"{index}. **{label}:** максимум")
+                continue
+            lines.append(
+                f"{index}. **{label}:** +{format_ap(entry['impact'])} AP / "
+                f"{format_ap(entry['cost'])} AP = "
+                f"**{format_ap(entry['impact_per_ap'])} AP/AP**"
+            )
+        return "\n".join(lines)
+
     def _upgrade_line(self, result) -> str:
         line = f"Улучшение #{result.id}: -{format_ap(result.cost)} AP"
         return line + "\n" + self._balance_line()
@@ -666,6 +722,8 @@ def help_text(command_prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 {command_prefix}crew
 {command_prefix}crew_ability <crew_id> <number|name> <level>
 {command_prefix}vectors
+{command_prefix}earnings_graph
+{command_prefix}roi
 {command_prefix}premium
 {command_prefix}premium mark <task_id>
 {command_prefix}categories
@@ -687,6 +745,30 @@ def format_upgrade_quote(quote: UpgradeQuote) -> str:
             f"(полная {format_ap(quote.full_cost)}, скидка {format_ap(quote.discount)})"
         )
     return f"{format_ap(quote.final_cost)} AP"
+
+
+def sparkline_text(values: list[Decimal], *, width: int = 32) -> str:
+    if not values:
+        return ""
+    blocks = "▁▂▃▄▅▆▇█"
+    if len(values) > width:
+        sampled: list[Decimal] = []
+        last_index = len(values) - 1
+        for index in range(width):
+            source_index = round(index * last_index / (width - 1))
+            sampled.append(values[source_index])
+        values = sampled
+    high = max(values)
+    low = Decimal("0.000")
+    if high <= low:
+        return blocks[0] * len(values)
+    result = []
+    for value in values:
+        ratio = (value - low) / (high - low)
+        block_index = int((ratio * (len(blocks) - 1)).to_integral_value())
+        block_index = max(0, min(len(blocks) - 1, block_index))
+        result.append(blocks[block_index])
+    return "".join(result)
 
 
 def format_retro_bonus(details: list[RetroBonusDetail]) -> str:

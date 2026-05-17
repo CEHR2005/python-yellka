@@ -150,6 +150,46 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(closed.json()["premium_awarded"], "0.000")
         self.assertEqual(categories.json()[0]["category"], "Модификаторы силы")
 
+    def test_category_close_notification_includes_premium_modifier(self) -> None:
+        notifier = FakeNotifier()
+        app = self.make_app(discord_notifier=notifier)
+        service = EconomyService(app.state.db_path)
+        service.create_cabin(
+            name="Тай Ли",
+            rank="SR",
+            dominants=[{"name": "Чтение Ауры", "level": 4}],
+        )
+
+        async def scenario():
+            async with self.client(app) as client:
+                created = await client.post(
+                    "/api/tasks",
+                    headers=self.auth(),
+                    json={"title": "поиск игрока", "category": "ИИ врагов"},
+                )
+                await client.post(
+                    f"/api/tasks/{created.json()['id']}/done",
+                    headers=self.auth(),
+                )
+                await client.post(
+                    f"/api/tasks/{created.json()['id']}/submit",
+                    headers=self.auth(),
+                )
+                return await client.post(
+                    "/api/categories/ИИ врагов/complete",
+                    headers=self.auth(),
+                )
+
+        response = self.run_async(scenario())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["premium_rate"], "0.550")
+        self.assertEqual(response.json()["premium_awarded"], "0.110")
+        self.assertEqual(len(notifier.messages), 2)
+        self.assertIn("Yellka: закрытие категории", notifier.messages[1])
+        self.assertIn("Ставка премии: 55% = 50% база + 5% crew", notifier.messages[1])
+        self.assertIn("Тай Ли (Чтение Ауры)", notifier.messages[1])
+
     def test_bootstrap_contains_ui_reference_data(self) -> None:
         async def scenario():
             async with self.client() as client:
@@ -264,10 +304,10 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("Yellka: сдача задачи", notifier.messages[0])
         self.assertIn("Сайты: лендинг", notifier.messages[0])
         self.assertIn("Начислено: +2 AP", notifier.messages[0])
-        self.assertIn("Расчет:", notifier.messages[0])
-        self.assertIn("База: 0.2 AP", notifier.messages[0])
-        self.assertIn("Основное: 10u * 0.2 AP = 2 AP", notifier.messages[0])
-        self.assertIn("Итого: 2 AP", notifier.messages[0])
+        self.assertIn("**Расчет**", notifier.messages[0])
+        self.assertIn("**База:** 0.2 AP", notifier.messages[0])
+        self.assertIn("**Основное:** 10u * 0.2 AP = 2 AP", notifier.messages[0])
+        self.assertIn("**Итого:** 2 AP", notifier.messages[0])
         self.assertIn("Yellka: покупка", notifier.messages[1])
         self.assertIn("Ядро Вычислений", notifier.messages[1])
         self.assertIn("Списано: -2 ap", notifier.messages[1])
@@ -308,11 +348,12 @@ class WebApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         message = notifier.messages[0]
-        self.assertIn("База: 0.225 AP = 0.2 AP Ядро + 0.025 AP crew", message)
-        self.assertIn("Вектор: x1.123 = x1 куплено + x0.123 crew", message)
-        self.assertIn("Вектор Асуна Юкио (Суб-Администратор): +0.123 = 0.1 * (130 - 7 СД)% = 0.123", message)
-        self.assertIn("База Асуна Юкио (Скорость Вспышки): +0.025 = 0.02 * (130 - 7 СД)% = 0.025", message)
-        self.assertIn("Основное: 1u * 0.225 AP * x1.123 = 0.253 AP", message)
+        self.assertIn("**База:** 0.225 AP = 0.2 AP Ядро + 0.025 AP crew", message)
+        self.assertIn("**Вектор:** x1.123 = x1 куплено + x0.123 crew", message)
+        self.assertIn("• **Вектор Асуна Юкио (Суб-Администратор):** +0.123 = `0.1 * (130 - 7 СД)% = 0.123`", message)
+        self.assertIn("• **База Асуна Юкио (Скорость Вспышки):** +0.025 = `0.02 * (130 - 7 СД)% = 0.025`", message)
+        self.assertIn("**Основное:** 0.225 AP * x1.123 = 0.253 AP", message)
+        self.assertNotIn("1u * 0.225 AP", message)
         self.assertNotIn("Каталог", message)
 
     def test_discord_notification_for_site_prestige_transactions(self) -> None:

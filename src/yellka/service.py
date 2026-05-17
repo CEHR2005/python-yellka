@@ -432,6 +432,104 @@ class EconomyService:
                 premium_and_other_earned=premium_and_other,
             )
 
+    def earned_ap_timeline(self, *, limit: int = 80) -> dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, amount, kind, note
+                FROM transactions
+                WHERE currency = ?
+                ORDER BY id ASC
+                """,
+                (AP,),
+            ).fetchall()
+        points: list[dict[str, Any]] = []
+        cumulative = Decimal("0.000")
+        for row in rows:
+            amount = parse_ap(row["amount"])
+            if amount <= 0:
+                continue
+            cumulative = parse_ap(cumulative + amount)
+            points.append(
+                {
+                    "id": int(row["id"]),
+                    "created_at": row["created_at"],
+                    "amount": db_ap(amount),
+                    "cumulative": db_ap(cumulative),
+                    "kind": row["kind"],
+                    "note": row["note"],
+                }
+            )
+        if limit > 0:
+            points = points[-limit:]
+        return {
+            "event_count": len(points),
+            "total": db_ap(cumulative),
+            "points": points,
+        }
+
+    def quote_upgrade_efficiency(self, vector: str = "code") -> dict[str, Any]:
+        vector_info = require_vector(vector)
+        if vector_info.key not in UPGRADABLE_VECTORS:
+            raise EconomyError(f"Vector {vector_info.title} is not upgradeable")
+        with self._connect() as conn:
+            crew_effects = self._active_crew_effects(conn)
+            base_rate = parse_ap(
+                self._get_decimal(conn, "base_rate") + crew_effects.base_rate_bonus
+            )
+            entries: list[dict[str, Any]] = []
+
+            core_quote = self._quote_core(conn)
+            vector_multiplier = self._current_vector_multiplier(
+                conn,
+                vector_info.key,
+                crew_effects,
+            )
+            core_step = parse_ap(core_quote.level_after - core_quote.level_before)
+            core_impact = parse_ap(core_step * vector_multiplier)
+            entries.append(
+                self._upgrade_efficiency_entry(
+                    kind="core",
+                    target="Ядро",
+                    cost=core_quote.final_cost,
+                    impact=core_impact,
+                    maxed=core_quote.maxed,
+                )
+            )
+
+            vector_quote = self._quote_vector(conn, vector_info.key)
+            vector_impact = (
+                parse_ap(VECTOR_STEP * base_rate)
+                if not vector_quote.maxed
+                else Decimal("0.000")
+            )
+            entries.append(
+                self._upgrade_efficiency_entry(
+                    kind="vector",
+                    target=vector_info.key,
+                    cost=vector_quote.final_cost,
+                    impact=vector_impact,
+                    maxed=vector_quote.maxed,
+                )
+            )
+
+        entries.sort(
+            key=lambda entry: (
+                Decimal(str(entry["impact_per_ap"])),
+                Decimal(str(entry["impact"])),
+            ),
+            reverse=True,
+        )
+        return {
+            "vector": vector_info.key,
+            "units": 1,
+            "catalog_weight": "1.000",
+            "base_rate": db_ap(base_rate),
+            "vector_multiplier": db_ap(vector_multiplier),
+            "core_step": db_ap(core_step),
+            "entries": entries,
+        }
+
     def set_upgrade_history_settings(
         self,
         *,
@@ -1467,6 +1565,7 @@ class EconomyService:
     def list_categories(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             self._sync_task_categories(conn)
+            premium_rate, premium_bonus_details = self._category_premium_rate(conn)
             rows = conn.execute(
                 """
                 SELECT c.category, c.completed, t.id, t.premium_received,
@@ -1491,6 +1590,12 @@ class EconomyService:
                     "premium_pending_reward_total": Decimal("0.000"),
                     "premium_total": Decimal("0.000"),
                     "premium_pending_total": Decimal("0.000"),
+                    "premium_rate": premium_rate,
+                    "premium_base_rate": Decimal("0.500"),
+                    "premium_bonus_rate": parse_ap(
+                        premium_rate - Decimal("0.500")
+                    ),
+                    "premium_bonus_details": premium_bonus_details,
                 },
             )
             if row["id"] is None:
@@ -1507,9 +1612,9 @@ class EconomyService:
             reward = parse_ap(row["reward"])
             item["reward_parts"][reward] = item["reward_parts"].get(reward, 0) + 1
         for item in categories.values():
-            item["premium_total"] = parse_ap(item["reward_total"] * Decimal("0.5"))
+            item["premium_total"] = parse_ap(item["reward_total"] * premium_rate)
             item["premium_pending_total"] = parse_ap(
-                item["premium_pending_reward_total"] * Decimal("0.5")
+                item["premium_pending_reward_total"] * premium_rate
             )
             item["reward_formula"] = self._format_reward_formula(
                 item["reward_parts"],
@@ -1524,6 +1629,7 @@ class EconomyService:
         if not category:
             raise ValueError("category must not be empty")
         with self._connect() as conn:
+            premium_rate, premium_bonus_details = self._category_premium_rate(conn)
             category_row = conn.execute(
                 "SELECT category FROM task_categories WHERE category = ?",
                 (category,),
@@ -1545,7 +1651,7 @@ class EconomyService:
                     (parse_ap(row["reward"]) for row in pending_rows),
                     Decimal("0.000"),
                 )
-                premium_awarded = parse_ap(pending_reward * Decimal("0.5"))
+                premium_awarded = parse_ap(pending_reward * premium_rate)
                 if premium_awarded:
                     self._insert_transaction(
                         conn,
@@ -1581,6 +1687,12 @@ class EconomyService:
             result = dict(row)
             result["premium_awarded"] = premium_awarded
             result["premium_task_count"] = premium_task_count
+            result["premium_rate"] = premium_rate
+            result["premium_base_rate"] = Decimal("0.500")
+            result["premium_bonus_rate"] = parse_ap(
+                premium_rate - Decimal("0.500")
+            )
+            result["premium_bonus_details"] = premium_bonus_details
             return result
 
     def list_upgrades(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -1726,6 +1838,47 @@ class EconomyService:
             discount=discount,
             final_cost=parse_ap(full_cost - discount),
         )
+
+    def _current_vector_multiplier(
+        self,
+        conn: sqlite3.Connection,
+        vector: str,
+        crew_effects: CrewEffects,
+    ) -> Decimal:
+        vector_info = require_vector(vector)
+        if vector_info.key == "media":
+            multiplier = Decimal("2.000")
+        else:
+            level = self._get_int(conn, f"vector_level:{vector_info.key}")
+            multiplier = parse_ap(Decimal("1.000") + VECTOR_STEP * level)
+        return parse_ap(
+            multiplier + crew_effects.vector_bonus.get(vector_info.key, Decimal("0.000"))
+        )
+
+    def _upgrade_efficiency_entry(
+        self,
+        *,
+        kind: str,
+        target: str,
+        cost: Decimal,
+        impact: Decimal,
+        maxed: bool,
+    ) -> dict[str, Any]:
+        impact = parse_ap(impact)
+        cost = parse_ap(cost)
+        impact_per_ap = (
+            parse_ap(impact / cost)
+            if cost > Decimal("0.000") and not maxed
+            else Decimal("0.000")
+        )
+        return {
+            "kind": kind,
+            "target": target,
+            "cost": db_ap(cost),
+            "impact": db_ap(impact),
+            "impact_per_ap": db_ap(impact_per_ap),
+            "maxed": maxed,
+        }
 
     def _discount(
         self,
@@ -2498,6 +2651,34 @@ class EconomyService:
             vector_upgrade_discount=parse_ap(vector_upgrade_discount),
             free_shop_items=frozenset(free_shop_items),
         )
+
+    def _category_premium_rate(
+        self,
+        conn: sqlite3.Connection,
+    ) -> tuple[Decimal, list[dict[str, str]]]:
+        rows = conn.execute(
+            """
+            SELECT name, dominants
+            FROM cabins
+            WHERE active = 1
+            """
+        ).fetchall()
+        bonus = Decimal("0.000")
+        details: list[dict[str, str]] = []
+        for row in rows:
+            for dominant in self._dominant_traits(row["dominants"]):
+                if self._normalize_trait_name(dominant["name"]) != "чтение ауры":
+                    continue
+                amount = Decimal("0.050")
+                bonus = parse_ap(bonus + amount)
+                details.append(
+                    {
+                        "source": str(row["name"]),
+                        "trait": dominant["name"],
+                        "amount": db_ap(amount),
+                    }
+                )
+        return parse_ap(Decimal("0.500") + bonus), details
 
     def _crew_task_bonus_details(
         self,

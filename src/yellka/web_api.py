@@ -598,33 +598,38 @@ def format_reward_calculation_lines(calculation: dict[str, Any]) -> list[str]:
         calculation.get("full_close_premium") or "0.000"
     )
     reward = display_amount(calculation.get("reward") or "0.000")
-    lines = ["Расчет:"]
+    lines = ["**Расчет**"]
     if crew_base != "0":
-        lines.append(f"База: {base_rate} AP = {core_base} AP Ядро + {crew_base} AP crew")
+        lines.append(
+            f"**База:** {base_rate} AP = {core_base} AP Ядро + {crew_base} AP crew"
+        )
     else:
-        lines.append(f"База: {base_rate} AP")
+        lines.append(f"**База:** {base_rate} AP")
     if crew_vector != "0":
-        lines.append(f"Вектор: x{vector} = x{purchased_vector} куплено + x{crew_vector} crew")
+        lines.append(
+            f"**Вектор:** x{vector} = x{purchased_vector} куплено + x{crew_vector} crew"
+        )
     elif vector != "1":
-        lines.append(f"Вектор: x{vector}")
+        lines.append(f"**Вектор:** x{vector}")
     if task_weight != "1":
-        lines.append(f"Вес задачи: x{task_weight}")
+        lines.append(f"**Вес задачи:** x{task_weight}")
     if priority != "1":
-        lines.append(f"Приоритет: x{priority}")
+        lines.append(f"**Приоритет:** x{priority}")
     lines.extend(format_crew_bonus_detail_lines(calculation))
-    factors = [f"{units}u", f"{base_rate} AP"]
+    factors = [] if units == 1 else [f"{units}u"]
+    factors.append(f"{base_rate} AP")
     if task_weight != "1":
         factors.append(f"x{task_weight}")
     if vector != "1":
         factors.append(f"x{vector}")
     if priority != "1":
         factors.append(f"x{priority}")
-    lines.append(f"Основное: {' * '.join(factors)} = {base_vector_total} AP")
+    lines.append(f"**Основное:** {' * '.join(factors)} = {base_vector_total} AP")
     if full_close != "1":
         lines.append(
-            f"Полное закрытие: премия x{full_close} = +{full_close_premium} AP"
+            f"**Полное закрытие:** премия x{full_close} = +{full_close_premium} AP"
         )
-    lines.append(f"Итого: {reward} AP")
+    lines.append(f"**Итого:** {reward} AP")
     return [line for line in lines if line]
 
 
@@ -644,7 +649,8 @@ def format_crew_bonus_detail_lines(calculation: dict[str, Any]) -> list[str]:
         title = f"{label} {source}"
         if trait:
             title = f"{title} ({trait})"
-        lines.append(f"{title}: +{amount} = {formula}")
+        formula_text = f"`{formula}`" if formula else ""
+        lines.append(f"• **{title}:** +{amount} = {formula_text}")
     return lines
 
 
@@ -677,15 +683,43 @@ def format_category_notification(
     name = str(category.get("category") or "Категория")
     premium = display_amount(category.get("premium_awarded") or "0.000")
     task_count = int(category.get("premium_task_count") or 0)
-    return "\n".join(
+    premium_rate = display_percent(category.get("premium_rate") or "0.500")
+    base_rate = display_percent(category.get("premium_base_rate") or "0.500")
+    bonus_rate = display_percent(category.get("premium_bonus_rate") or "0.000")
+    lines = [
+        "Yellka: закрытие категории",
+        name,
+        f"Премия: +{premium} AP",
+        f"Ставка премии: {premium_rate} = {base_rate} база + {bonus_rate} crew",
+    ]
+    lines.extend(format_category_premium_bonus_lines(category))
+    lines.extend(
         [
-            "Yellka: закрытие категории",
-            name,
-            f"Премия: +{premium} AP",
             f"Задач премировано: {task_count}",
             f"Баланс AP: {wallet_balance(wallet, 'ap')}",
         ]
     )
+    return "\n".join(lines)
+
+
+def display_percent(value: Any) -> str:
+    return f"{display_amount(parse_decimal_payload(value) * Decimal('100'))}%"
+
+
+def format_category_premium_bonus_lines(category: dict[str, Any]) -> list[str]:
+    raw_details = category.get("premium_bonus_details")
+    if not isinstance(raw_details, list):
+        return []
+    lines = []
+    for detail in raw_details:
+        if not isinstance(detail, dict):
+            continue
+        source = str(detail.get("source") or "crew")
+        trait = str(detail.get("trait") or "").strip()
+        amount = display_percent(detail.get("amount") or "0.000")
+        title = source if not trait else f"{source} ({trait})"
+        lines.append(f"• **{title}:** +{amount} к премии категории")
+    return lines
 
 
 def format_prestige_notification(
