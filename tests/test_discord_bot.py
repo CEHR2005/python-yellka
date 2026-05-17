@@ -131,6 +131,31 @@ class DiscordCommandHandlerTests(unittest.TestCase):
         self.assertTrue(is_task_result_response("Задача #12: +0.2 AP"))
         self.assertFalse(is_task_result_response("Баланс: 3 AP"))
 
+    def test_crew_ability_command_updates_dominant_level_by_id(self) -> None:
+        handler = self.make_handler()
+        handler.service.create_cabin(
+            name="Асуна Юкио",
+            universe="SAO.V1",
+            rank="S",
+            sedative_dose="7",
+            dominants=[
+                {"name": "Суб-Администратор", "level": 1},
+                {"name": "Скорость Вспышки", "level": 1},
+            ],
+        )
+
+        listed = handler.handle_message("!crew")
+        updated = handler.handle_message("!crew_ability 1 1 2")
+        updated_by_name = handler.handle_message('!crew_ability 1 "Скорость Вспышки" 3')
+
+        self.assertIsNotNone(listed)
+        self.assertIn("#1 Асуна Юкио", listed)
+        self.assertIsNotNone(updated)
+        self.assertIn("1. Суб-Администратор ур.2", updated)
+        self.assertIsNotNone(updated_by_name)
+        self.assertIn("2. Скорость Вспышки ур.3", updated_by_name)
+        self.assertTrue(handler.last_message_changed_state)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,33 @@ export type TrackerTask = {
   submitted: boolean
 }
 
+export type RetroBufferTask = {
+  id: number
+  created_at: string
+  category: string
+  title: string
+  units: number
+  vector: string
+  paid_base_rate: string
+  current_base_rate: string
+  current_reward: string
+  gross_delta: string
+  fee_share: string
+  net_delta: string
+  eligible: boolean
+}
+
+export type RetroBuffer = {
+  eligible_count: number
+  limit: number
+  gross: string
+  fee: string
+  net: string
+  commission_rate: string
+  activation_allowed: boolean
+  tasks: RetroBufferTask[]
+}
+
 export type BootstrapPayload = {
   balance: BalanceState
   categories: Category[]
@@ -61,10 +88,13 @@ export type BootstrapPayload = {
   wallet: Wallet
   shop_catalog: ShopItem[]
   shop_purchases: ShopPurchase[]
+  history: HistoryEntry[]
   effects: ActiveEffect[]
   prime: PrimeStatus
+  crew_upkeep: CrewUpkeep
   expeditions: Expedition[]
   cabins: Cabin[]
+  retro_buffer: RetroBuffer
 }
 
 export type TaskPayload = {
@@ -133,6 +163,22 @@ export type ShopPurchase = {
   metadata: string
 }
 
+export type HistoryEntry = {
+  id: string
+  kind: "purchase" | "task_submit"
+  created_at: string
+  title: string
+  section: string
+  amount: string
+  currency: string
+  target: string
+  note: string
+  purchase_id: number | null
+  tracker_task_id: number | null
+  economy_task_id: number | null
+  revertible: boolean
+}
+
 export type ActiveEffect = {
   key: string
   title: string
@@ -143,8 +189,18 @@ export type ActiveEffect = {
 
 export type PrimeStatus = {
   active: boolean
+  active_since: string
   weeks_purchased: number
   loyalty_weeks: number
+}
+
+export type CrewUpkeep = {
+  active_count: number
+  base_total: string
+  discount_total: string
+  effective_total: string
+  discount_rate: string
+  prime_active: boolean
 }
 
 export type Expedition = {
@@ -161,11 +217,85 @@ export type Expedition = {
 export type Cabin = {
   id: number
   created_at: string
+  sample_code: string
   name: string
+  universe: string
   rank: string
   tags: string
+  full_tags: string
   sedative_dose: string
+  upkeep: string
+  base_upkeep: string
+  upkeep_discount: string
+  effective_upkeep: string
+  subscription_tier: string
+  subscription_started_at: string
+  recessive_name: string
+  recessive_description: string
+  dominants: string
+  dominant_max_level: number
   active: number
+  note: string
+  sr_promotion: SrPromotion
+}
+
+export type SrPromotion = {
+  available: boolean
+  reason: string
+  cost: string
+  currency: string
+  required_dominant_level: number
+}
+
+export type CabinUpgradeResult = Cabin & {
+  dominant_name: string
+  level_before: number
+  level_after: number
+  upgrade_cost: string
+  balance_before: string
+  balance_after: string
+  balance_delta: string
+}
+
+export type CabinDefectExciseResult = Cabin & {
+  excised_defect: string
+  excision_cost: string
+  excision_currency: string
+  purchase_id: number
+  balance_before: string
+  balance_after: string
+}
+
+export type CabinSrPromotionResult = Cabin & {
+  promotion_cost: string
+  promotion_currency: string
+  purchase_id: number
+  ap_balance_before: string
+  ap_balance_after: string
+  shadow_balance_before: string
+  shadow_balance_after: string
+}
+
+export type DominantTraitPayload = {
+  name: string
+  level: number
+}
+
+export type CabinPayload = {
+  sample_code: string
+  name: string
+  universe: string
+  rank: string
+  tags: string
+  full_tags: string
+  sedative_dose: string
+  upkeep: string
+  subscription_tier: string
+  subscription_started_at: string
+  recessive_name: string
+  recessive_description: string
+  dominants: DominantTraitPayload[]
+  active: boolean
   note: string
 }
 
@@ -229,6 +359,14 @@ export const api = {
     request<TrackerTask>(`/api/tasks/${id}/done`, token, { method: "POST" }),
   submitTask: (token: string, id: number) =>
     request<TrackerTask>(`/api/tasks/${id}/submit`, token, { method: "POST" }),
+  revertTaskSubmit: (token: string, id: number) =>
+    request<TrackerTask>(`/api/tasks/${id}/revert-submit`, token, { method: "POST" }),
+  history: (token: string) =>
+    request<HistoryEntry[]>("/api/history", token),
+  retroBuffer: (token: string) =>
+    request<RetroBuffer>("/api/retro-buffer", token),
+  activateRetroBuffer: (token: string) =>
+    request<RetroBuffer>("/api/retro-buffer/activate", token, { method: "POST" }),
   quoteShop: (token: string, payload: ShopPayload) =>
     request<ShopQuote>("/api/shop/quote", token, {
       method: "POST",
@@ -244,10 +382,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  createCabin: (token: string, payload: { name: string; rank: string; tags: string; note: string }) =>
+  createCabin: (token: string, payload: CabinPayload) =>
     request<Cabin>("/api/cabins", token, {
       method: "POST",
       body: JSON.stringify(payload),
+    }),
+  updateCabin: (token: string, id: number, payload: CabinPayload) =>
+    request<Cabin>(`/api/cabins/${id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  upgradeCabinDominant: (token: string, id: number, dominantIndex: number) =>
+    request<CabinUpgradeResult>(`/api/cabins/${id}/dominants/${dominantIndex}/upgrade`, token, {
+      method: "POST",
+    }),
+  exciseCabinDefect: (token: string, id: number) =>
+    request<CabinDefectExciseResult>(`/api/cabins/${id}/defect/excise`, token, {
+      method: "POST",
+    }),
+  promoteCabinToSr: (token: string, id: number) =>
+    request<CabinSrPromotionResult>(`/api/cabins/${id}/promote/sr`, token, {
+      method: "POST",
+    }),
+  deleteCabin: (token: string, id: number) =>
+    request<Cabin>(`/api/cabins/${id}`, token, {
+      method: "DELETE",
     }),
   prestige: (token: string, prime = false) =>
     request<Record<string, unknown>>("/api/prestige", token, {

@@ -54,6 +54,33 @@ class TrackerTaskTests(unittest.TestCase):
         with self.assertRaises(EconomyError):
             service.submit_tracker_task(task["id"])
 
+    def test_submitted_tracker_task_appears_in_history_and_can_be_reverted(self) -> None:
+        service = self.make_service()
+        task = service.create_tracker_task(
+            title="поиск игрока",
+            category="ИИ врагов",
+            units=2,
+        )
+        service.mark_tracker_task_done(task["id"])
+        submitted = service.submit_tracker_task(task["id"])
+
+        history = service.list_history_entries()
+
+        self.assertEqual(history[0]["kind"], "task_submit")
+        self.assertEqual(history[0]["title"], "ИИ врагов: поиск игрока")
+        self.assertEqual(history[0]["amount"], "0.400")
+        self.assertTrue(history[0]["revertible"])
+        self.assertEqual(history[0]["tracker_task_id"], task["id"])
+
+        reverted = service.revert_tracker_task_submission(task["id"])
+
+        self.assertEqual(reverted["status"], "done")
+        self.assertIsNone(reverted["economy_task_id"])
+        self.assertEqual(reverted["submitted_reward"], "0.000")
+        self.assertEqual(service.get_state().balance, Decimal("0.000"))
+        self.assertEqual(service.list_tasks(limit=1), [])
+        self.assertEqual(service.list_transactions(limit=1), [])
+
     def test_tracker_task_must_be_done_before_submit(self) -> None:
         service = self.make_service()
         task = service.create_tracker_task(title="Черновик")

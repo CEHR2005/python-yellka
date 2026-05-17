@@ -482,6 +482,24 @@ class DiscordCommandHandler:
                 self._task_line(row)
                 for row in rows
             )
+        if command in {"crew", "экипаж"}:
+            rows = self.service.list_cabins()
+            if not rows:
+                return "Экипаж пуст"
+            return "\n".join(self._crew_line(row) for row in rows)
+        if command in {"crew_ability", "crew_abil", "ability", "абилки"}:
+            if len(args) < 4:
+                raise ValueError(
+                    f"Usage: {self.command_prefix}crew_ability <crew_id> <number|name> <level>"
+                )
+            cabin_id = int(args[1])
+            level = int(args[-1])
+            dominant = " ".join(args[2:-1])
+            if dominant.isdigit():
+                dominant = int(dominant)
+            row = self.service.update_cabin_dominant_level(cabin_id, dominant, level)
+            self.last_message_changed_state = True
+            return f"Экипаж обновлен:\n{self._crew_line(row)}"
         if command == "premium":
             if len(args) > 1 and args[1] == "mark":
                 if len(args) < 3:
@@ -619,6 +637,21 @@ class DiscordCommandHandler:
             f"(к получению {format_ap(row['premium_pending_total'])})"
         )
 
+    def _crew_line(self, row: dict[str, Any]) -> str:
+        tags = row.get("tags") or row.get("full_tags") or "без тэгов"
+        traits = self.service._dominant_traits(row.get("dominants", "[]"))
+        traits_text = ", ".join(
+            f"{idx}. {trait['name']} ур.{trait['level']}"
+            for idx, trait in enumerate(traits, start=1)
+        ) or "доминант нет"
+        source = row.get("universe") or "?"
+        active = "активна" if int(row.get("active", 0)) else "архив"
+        return (
+            f"#{row['id']} {row['name']} ({source}) [{row['rank']}, {active}, СД {format_ap(row['sedative_dose'])}%]\n"
+            f"Тэги: {tags}\n"
+            f"Доминанты: {traits_text}"
+        )
+
     def _help(self) -> str:
         return help_text(self.command_prefix)
 
@@ -630,6 +663,8 @@ def help_text(command_prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 {command_prefix}spend <amount> [note]
 {command_prefix}complete <title> [units]
 {command_prefix}tasks
+{command_prefix}crew
+{command_prefix}crew_ability <crew_id> <number|name> <level>
 {command_prefix}vectors
 {command_prefix}premium
 {command_prefix}premium mark <task_id>

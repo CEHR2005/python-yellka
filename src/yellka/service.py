@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from .catalog import UPGRADABLE_VECTORS, VECTORS, find_catalog_item, require_vector
-from .money import db_ap, parse_ap
+from .money import db_ap, format_ap, parse_ap
 from .shop_catalog import (
     AP,
     NEURAL_SHARD,
@@ -27,11 +29,15 @@ VECTOR_STEP = Decimal("0.100")
 VECTOR_MAX_LEVEL = 10
 CASHBACK_MAX_LEVEL = 5
 CASHBACK_PURCHASE_BASE_COST = Decimal("3.000")
+PRIME_UPKEEP_DISCOUNT_RATE = Decimal("0.250")
+SR_UPKEEP = Decimal("3.000")
+SR_REQUIRED_DOMINANT_LEVEL = 4
 RETROACTIVE_INDEXING_COST = Decimal("25.000")
-RETRO_BUFFER_BASE_LIMIT = 20
+RETRO_BUFFER_BASE_LIMIT = 10
 RETRO_BUFFER_BASE_COMMISSION = Decimal("0.300")
 RETRO_BUFFER_MIN_FEE = Decimal("1.000")
 UPDATE_BONUS = Decimal("2.500")
+DOMINANT_UPGRADE_COST = Decimal("3.000")
 DEFAULT_DISCOUNT_START_BASE = Decimal("0.800")
 DEFAULT_DISCOUNT_PURCHASE_COST = Decimal("15.000")
 DEFAULT_HISTORICAL_DISCOUNT_CASHBACK = Decimal("18.270")
@@ -161,6 +167,17 @@ class EarningsStats:
     premium_and_other_earned: Decimal
 
 
+@dataclass(frozen=True)
+class CrewEffects:
+    base_rate_bonus: Decimal
+    vector_bonus: dict[str, Decimal]
+    full_close_bonus: Decimal
+    shop_flat_discount: dict[str, Decimal]
+    shop_percent_discount: dict[str, Decimal]
+    vector_upgrade_discount: Decimal
+    free_shop_items: frozenset[str]
+
+
 class EconomyService:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -242,21 +259,33 @@ class EconomyService:
 
         with self._connect() as conn:
             base_rate = self._get_decimal(conn, "base_rate")
+            crew_effects = self._active_crew_effects(conn)
+            effective_base_rate = parse_ap(base_rate + crew_effects.base_rate_bonus)
             if vector_info.key == "media":
                 vector_level = 0
                 vector_multiplier = Decimal("2.000")
             else:
                 vector_level = self._get_int(conn, f"vector_level:{vector_info.key}")
                 vector_multiplier = parse_ap(Decimal("1") + VECTOR_STEP * vector_level)
+            crew_vector_bonus = crew_effects.vector_bonus.get(
+                vector_info.key,
+                Decimal("0.000"),
+            )
+            vector_multiplier = parse_ap(vector_multiplier + crew_vector_bonus)
             priority_multiplier = PRIORITY_MULTIPLIER if priority else Decimal("1.000")
-            full_close_bonus = FULL_CLOSE_MULTIPLIER if full_close else Decimal("1.000")
+            full_close_bonus = (
+                parse_ap(FULL_CLOSE_MULTIPLIER + crew_effects.full_close_bonus)
+                if full_close
+                else Decimal("1.000")
+            )
+            task_multiplier = parse_ap(
+                vector_multiplier * priority_multiplier * full_close_bonus
+            )
             reward = parse_ap(
                 Decimal(units)
-                * base_rate
+                * effective_base_rate
                 * task_weight
-                * vector_multiplier
-                * priority_multiplier
-                * full_close_bonus
+                * task_multiplier
             )
 
             now = self._now()
@@ -265,10 +294,10 @@ class EconomyService:
                 INSERT INTO tasks (
                     created_at, category, title, vector, units, base_rate, vector_level,
                     vector_multiplier, priority_multiplier, full_close_bonus,
-                    catalog_weight, reward, current_reward,
+                    catalog_weight, crew_vector_bonus, reward, current_reward,
                     retro_paid_base_rate, premium_received, note
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -276,12 +305,13 @@ class EconomyService:
                     item_title,
                     vector_info.key,
                     units,
-                    db_ap(base_rate),
+                    db_ap(effective_base_rate),
                     vector_level,
                     db_ap(vector_multiplier),
                     db_ap(priority_multiplier),
                     db_ap(full_close_bonus),
                     db_ap(task_weight),
+                    db_ap(crew_vector_bonus),
                     db_ap(reward),
                     db_ap(reward),
                     db_ap(base_rate),
@@ -302,6 +332,11 @@ class EconomyService:
     def buy_core(self) -> UpgradeResult:
         with self._connect() as conn:
             quote = self._quote_core(conn)
+            shadow_base_after = None
+            if self._get_shop_level(conn, "noctur.core_rewrite"):
+                shadow_base_after = parse_ap(
+                    self._core_shadow_base(conn, parse_ap(quote.level_before)) + CORE_STEP
+                )
             result = self._buy_upgrade(
                 conn,
                 upgrade_type="core",
@@ -312,6 +347,8 @@ class EconomyService:
                 cashback_eligible=True,
             )
             self._set_meta(conn, "base_rate", db_ap(quote.level_after))
+            if shadow_base_after is not None:
+                self._set_meta(conn, "core_shadow_base", db_ap(shadow_base_after))
             return result
 
     def quote_core_upgrade(self) -> UpgradeQuote:
@@ -334,6 +371,7 @@ class EconomyService:
                 level_after=str(quote.level_after),
                 cost=quote.full_cost,
                 cashback_eligible=True,
+                extra_discount_rate=self._active_crew_effects(conn).vector_upgrade_discount,
             )
             self._set_meta(conn, f"vector_level:{vector_info.key}", str(quote.level_after))
             self._apply_cascade_resonance(conn, vector_info.key)
@@ -570,6 +608,38 @@ class EconomyService:
             ).fetchall()
         return [self._shop_purchase_dict(row) for row in rows]
 
+    def list_history_entries(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            purchases = [
+                self._history_purchase_entry(row)
+                for row in conn.execute(
+                    """
+                    SELECT *
+                    FROM shop_purchases
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            ]
+            task_submissions = [
+                self._history_task_submission_entry(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, created_at, updated_at, category, title,
+                        economy_task_id, submitted_reward, submitted_retro_bonus
+                    FROM tracker_tasks
+                    WHERE status = ? AND economy_task_id IS NOT NULL
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (TRACKER_STATUS_SUBMITTED, limit),
+                ).fetchall()
+            ]
+        entries = purchases + task_submissions
+        entries.sort(key=lambda item: str(item["created_at"]), reverse=True)
+        return entries[:limit]
+
     def get_shop_purchase(self, purchase_id: int) -> dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
@@ -584,6 +654,10 @@ class EconomyService:
         with self._connect() as conn:
             return self._quote_retro_buffer(conn)
 
+    def get_retro_buffer(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            return self._retro_buffer_payload(conn)
+
     def list_effects(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -595,8 +669,30 @@ class EconomyService:
         with self._connect() as conn:
             return {
                 "active": self._get_bool(conn, "prime_active"),
+                "active_since": self._get_meta(conn, "prime_active_since"),
                 "weeks_purchased": self._get_int(conn, "prime_weeks_purchased"),
                 "loyalty_weeks": self._get_int(conn, "prime_loyalty_weeks"),
+            }
+
+    def crew_upkeep_summary(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM cabins WHERE active = 1").fetchall()
+            discount_rate = self._crew_upkeep_discount_rate(conn)
+            base_total = Decimal("0.000")
+            discount_total = Decimal("0.000")
+            effective_total = Decimal("0.000")
+            for row in rows:
+                upkeep = self._cabin_upkeep(row, discount_rate)
+                base_total = parse_ap(base_total + upkeep["base"])
+                discount_total = parse_ap(discount_total + upkeep["discount"])
+                effective_total = parse_ap(effective_total + upkeep["effective"])
+            return {
+                "active_count": len(rows),
+                "base_total": db_ap(base_total),
+                "discount_total": db_ap(discount_total),
+                "effective_total": db_ap(effective_total),
+                "discount_rate": db_ap(discount_rate),
+                "prime_active": self._get_bool(conn, "prime_active"),
             }
 
     def list_expeditions(self) -> list[dict[str, Any]]:
@@ -627,7 +723,7 @@ class EconomyService:
     def list_cabins(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM cabins ORDER BY id DESC").fetchall()
-        return [dict(row) for row in rows]
+            return [self._cabin_dict(conn, row) for row in rows]
 
     def create_cabin(
         self,
@@ -635,20 +731,350 @@ class EconomyService:
         name: str,
         rank: str = "C",
         tags: str = "",
+        sample_code: str = "",
+        universe: str = "",
+        full_tags: str = "",
+        sedative_dose: Decimal | int | str = "0",
+        upkeep: Decimal | int | str = "0",
+        subscription_tier: str = "",
+        subscription_started_at: str = "",
+        recessive_name: str = "",
+        recessive_description: str = "",
+        dominants: list[dict[str, Any]] | str | None = None,
+        active: bool = True,
         note: str = "",
     ) -> dict[str, Any]:
         name = name.strip()
         if not name:
             raise ValueError("name must not be empty")
+        active_tags = tags.strip() or full_tags.strip()
         with self._connect() as conn:
+            dominants_json = self._dominants_json(
+                dominants,
+                max_level=self._dominant_max_level(conn, rank),
+            )
             cur = conn.execute(
                 """
-                INSERT INTO cabins (created_at, name, rank, tags, sedative_dose, active, note)
-                VALUES (?, ?, ?, ?, '0.000', 1, ?)
+                INSERT INTO cabins (
+                    created_at, sample_code, name, universe, rank, tags, full_tags,
+                    sedative_dose, upkeep, subscription_tier, subscription_started_at,
+                    recessive_name, recessive_description,
+                    dominants, active, note
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (self._now(), name, rank.strip(), tags.strip(), note.strip()),
+                (
+                    self._now(),
+                    sample_code.strip(),
+                    name,
+                    universe.strip(),
+                    rank.strip(),
+                    active_tags,
+                    full_tags.strip(),
+                    db_ap(sedative_dose),
+                    db_ap(upkeep),
+                    subscription_tier.strip(),
+                    subscription_started_at.strip(),
+                    recessive_name.strip(),
+                    recessive_description.strip(),
+                    dominants_json,
+                    1 if active else 0,
+                    note.strip(),
+                ),
             )
-            return dict(conn.execute("SELECT * FROM cabins WHERE id = ?", (cur.lastrowid,)).fetchone())
+            row = conn.execute("SELECT * FROM cabins WHERE id = ?", (cur.lastrowid,)).fetchone()
+            return self._cabin_dict(conn, row)
+
+    def update_cabin(self, cabin_id: int, **changes: Any) -> dict[str, Any]:
+        allowed = {
+            "sample_code",
+            "name",
+            "universe",
+            "rank",
+            "tags",
+            "full_tags",
+            "sedative_dose",
+            "upkeep",
+            "subscription_tier",
+            "subscription_started_at",
+            "recessive_name",
+            "recessive_description",
+            "dominants",
+            "active",
+            "note",
+        }
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            if row is None:
+                raise EconomyError(f"Cabin not found: {cabin_id}")
+            values: dict[str, Any] = {}
+            rank = str(changes.get("rank") if changes.get("rank") is not None else row["rank"])
+            for key, value in changes.items():
+                if key not in allowed or value is None:
+                    continue
+                if key in {"sedative_dose", "upkeep"}:
+                    values[key] = db_ap(value)
+                elif key == "dominants":
+                    values[key] = self._dominants_json(
+                        value,
+                        max_level=self._dominant_max_level(conn, rank),
+                    )
+                elif key == "active":
+                    values[key] = 1 if value else 0
+                else:
+                    values[key] = str(value).strip()
+            if "name" in values and not values["name"]:
+                raise ValueError("name must not be empty")
+            if not values:
+                return self._cabin_dict(conn, row)
+            assignments = ", ".join(f"{key} = ?" for key in values)
+            conn.execute(
+                f"UPDATE cabins SET {assignments} WHERE id = ?",
+                (*values.values(), cabin_id),
+            )
+            row = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            return self._cabin_dict(conn, row)
+
+    def update_cabin_dominant_level(
+        self,
+        cabin_id: int,
+        dominant: int | str,
+        level: int,
+    ) -> dict[str, Any]:
+        if level < 1:
+            raise ValueError("dominant level must be at least 1")
+        cabin = self.get_cabin(cabin_id)
+        traits = self._dominant_traits(cabin["dominants"])
+        if not traits:
+            raise EconomyError(f"Cabin #{cabin_id} has no dominant traits")
+        if isinstance(dominant, int) or str(dominant).isdigit():
+            index = int(dominant) - 1
+            if index < 0 or index >= len(traits):
+                raise ValueError(f"dominant index must be between 1 and {len(traits)}")
+        else:
+            target = self._normalize_trait_name(str(dominant))
+            index = next(
+                (
+                    idx
+                    for idx, trait in enumerate(traits)
+                    if self._normalize_trait_name(trait["name"]) == target
+                ),
+                -1,
+            )
+            if index < 0:
+                raise EconomyError(f"Dominant trait not found in cabin #{cabin_id}: {dominant}")
+        traits[index] = {**traits[index], "level": level}
+        return self.update_cabin(cabin_id, dominants=traits)
+
+    def upgrade_cabin_dominant(
+        self,
+        cabin_id: int,
+        dominant: int | str,
+    ) -> dict[str, Any]:
+        cost = parse_ap(DOMINANT_UPGRADE_COST)
+        with self._connect() as conn:
+            cabin = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            if cabin is None:
+                raise EconomyError(f"Cabin not found: {cabin_id}")
+            traits = self._dominant_traits(cabin["dominants"])
+            if not traits:
+                raise EconomyError(f"Cabin #{cabin_id} has no dominant traits")
+            if isinstance(dominant, int) or str(dominant).isdigit():
+                index = int(dominant) - 1
+                if index < 0 or index >= len(traits):
+                    raise ValueError(f"dominant index must be between 1 and {len(traits)}")
+            else:
+                target = self._normalize_trait_name(str(dominant))
+                index = next(
+                    (
+                        idx
+                        for idx, trait in enumerate(traits)
+                        if self._normalize_trait_name(trait["name"]) == target
+                    ),
+                    -1,
+                )
+                if index < 0:
+                    raise EconomyError(f"Dominant trait not found in cabin #{cabin_id}: {dominant}")
+
+            ap_before = self._balance(conn, AP)
+            shadow_before = self._balance(conn, SHADOW_AP)
+            self._ensure_can_spend(conn, cost)
+            trait = traits[index]
+            level_before = int(trait["level"])
+            max_level = self._dominant_max_level(conn, str(cabin["rank"]))
+            if level_before >= max_level:
+                raise EconomyError(
+                    f"Dominant trait is already at max level {max_level} for {cabin['rank']} rank"
+                )
+            level_after = level_before + 1
+            traits[index] = {**trait, "level": level_after}
+            dominants_json = self._dominants_json(traits, max_level=max_level)
+            conn.execute(
+                "UPDATE cabins SET dominants = ? WHERE id = ?",
+                (dominants_json, cabin_id),
+            )
+            note = (
+                f"Прокачка черты экипажа: {cabin['name']} - "
+                f"{trait['name']} Lv.{level_before} -> Lv.{level_after}"
+            )
+            self._spend_ap_with_shadow(
+                conn,
+                cost,
+                "crew_dominant_upgrade",
+                note,
+                source="crew",
+            )
+            updated = self._cabin_dict(
+                conn,
+                conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone(),
+            )
+            ap_after = self._balance(conn, AP)
+            shadow_after = self._balance(conn, SHADOW_AP)
+        updated.update(
+            {
+                "dominant_name": trait["name"],
+                "level_before": level_before,
+                "level_after": level_after,
+                "upgrade_cost": db_ap(cost),
+                "balance_before": db_ap(ap_before),
+                "balance_after": db_ap(ap_after),
+                "balance_delta": db_ap(ap_after - ap_before),
+                "shadow_balance_before": db_ap(shadow_before),
+                "shadow_balance_after": db_ap(shadow_after),
+                "shadow_balance_delta": db_ap(shadow_after - shadow_before),
+            }
+        )
+        return updated
+
+    def excise_cabin_defect(self, cabin_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            cabin = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            if cabin is None:
+                raise EconomyError(f"Cabin not found: {cabin_id}")
+            defect_name = str(cabin["recessive_name"] or "").strip()
+            if not defect_name:
+                raise EconomyError(f"Cabin #{cabin_id} has no defect to excise")
+            quote = self._quote_shop_purchase(
+                conn,
+                "genesis.defect_excision",
+                target=f"cabin:{cabin_id}",
+                quantity=1,
+                options={},
+            )
+            if not quote.available:
+                raise EconomyError(quote.reason or "Defect excision is not available")
+            balance_before = self._balance(conn, quote.currency)
+            note = f"Иссечение недостатка: {cabin['name']} - {defect_name}"
+            purchase_id = self._insert_shop_purchase(conn, quote, note)
+            self._spend_currency(
+                conn,
+                quote.final_cost,
+                quote.currency,
+                f"Shop purchase: {quote.title}",
+                purchase_id=purchase_id,
+            )
+            self._apply_shop_effect(conn, quote, purchase_id, note)
+            conn.execute(
+                """
+                UPDATE cabins
+                SET recessive_name = '', recessive_description = ''
+                WHERE id = ?
+                """,
+                (cabin_id,),
+            )
+            updated = self._cabin_dict(
+                conn,
+                conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone(),
+            )
+            balance_after = self._balance(conn, quote.currency)
+        updated.update(
+            {
+                "excised_defect": defect_name,
+                "excision_cost": db_ap(quote.final_cost),
+                "excision_currency": quote.currency,
+                "purchase_id": purchase_id,
+                "balance_before": db_ap(balance_before),
+                "balance_after": db_ap(balance_after),
+            }
+        )
+        return updated
+
+    def promote_cabin_to_sr(self, cabin_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            cabin = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            if cabin is None:
+                raise EconomyError(f"Cabin not found: {cabin_id}")
+            quote = self._quote_cabin_sr_promotion(conn, cabin)
+            if not quote["available"]:
+                raise EconomyError(str(quote["reason"]))
+            item = require_shop_item("genesis.rank_change")
+            full_cost = parse_ap(SR_UPKEEP)
+            final_cost = parse_ap(quote["cost"])
+            shop_quote = ShopQuote(
+                item.key,
+                item.title,
+                item.section,
+                f"cabin:{cabin_id}",
+                1,
+                AP,
+                full_cost,
+                parse_ap(full_cost - final_cost),
+                final_cost,
+                True,
+                "",
+                {"rank_before": cabin["rank"], "rank_after": "SR"},
+            )
+            ap_before = self._balance(conn, AP)
+            shadow_before = self._balance(conn, SHADOW_AP)
+            note = f"Повышение ранга: {cabin['name']} S -> SR"
+            purchase_id = self._insert_shop_purchase(conn, shop_quote, note)
+            self._spend_currency(
+                conn,
+                final_cost,
+                AP,
+                f"Shop purchase: {shop_quote.title}",
+                purchase_id=purchase_id,
+            )
+            conn.execute(
+                """
+                UPDATE cabins
+                SET rank = 'SR', upkeep = ?, subscription_tier = 'SR',
+                    subscription_started_at = ?
+                WHERE id = ?
+                """,
+                (db_ap(SR_UPKEEP), self._now()[:10], cabin_id),
+            )
+            updated = self._cabin_dict(
+                conn,
+                conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone(),
+            )
+            ap_after = self._balance(conn, AP)
+            shadow_after = self._balance(conn, SHADOW_AP)
+        updated.update(
+            {
+                "promotion_cost": db_ap(final_cost),
+                "promotion_currency": AP,
+                "purchase_id": purchase_id,
+                "ap_balance_before": db_ap(ap_before),
+                "ap_balance_after": db_ap(ap_after),
+                "shadow_balance_before": db_ap(shadow_before),
+                "shadow_balance_after": db_ap(shadow_after),
+            }
+        )
+        return updated
+
+    def delete_cabin(self, cabin_id: int) -> dict[str, Any]:
+        cabin = self.get_cabin(cabin_id)
+        with self._connect() as conn:
+            conn.execute("DELETE FROM cabins WHERE id = ?", (cabin_id,))
+        return cabin
+
+    def get_cabin(self, cabin_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM cabins WHERE id = ?", (cabin_id,)).fetchone()
+            if row is None:
+                raise EconomyError(f"Cabin not found: {cabin_id}")
+            return self._cabin_dict(conn, row)
 
     def run_prestige(self, *, prime: bool = False) -> dict[str, Any]:
         with self._connect() as conn:
@@ -674,7 +1100,21 @@ class EconomyService:
                     currency=SINGULARITY_SHARD,
                     source="prestige",
                 )
+            ap_balance = self._balance(conn, AP)
+            if ap_balance:
+                self._insert_transaction(
+                    conn,
+                    -ap_balance,
+                    "prestige_reset",
+                    "Collapse reset factual AP",
+                    currency=AP,
+                    source="prestige",
+                    real_ap_amount=Decimal("0.000"),
+                )
+            max_task = conn.execute("SELECT COALESCE(MAX(id), 0) AS id FROM tasks").fetchone()
+            self._set_meta(conn, "retro_buffer_cleared_task_id", str(int(max_task["id"])))
             self._set_meta(conn, "base_rate", db_ap(DEFAULT_BASE_RATE))
+            self._set_meta(conn, "core_shadow_base", db_ap(DEFAULT_BASE_RATE))
             self._set_meta(conn, "cashback_level", "0")
             for key in UPGRADABLE_VECTORS:
                 self._set_meta(conn, f"vector_level:{key}", "0")
@@ -708,7 +1148,8 @@ class EconomyService:
                 f"""
                 SELECT id, created_at, category, title, vector, units, base_rate,
                     vector_level, vector_multiplier, priority_multiplier,
-                    full_close_bonus, catalog_weight, reward, current_reward,
+                    full_close_bonus, catalog_weight, crew_vector_bonus,
+                    reward, current_reward,
                     retro_paid_base_rate, premium_received, note
                 FROM tasks
                 {where}
@@ -946,7 +1387,57 @@ class EconomyService:
                 ),
             )
             row = self._get_tracker_task_row(conn, task_id)
-        return self._tracker_task_dict(row)
+            task_row = self._get_task_row(conn, result.id)
+            crew_bonus_details = (
+                self._crew_task_bonus_details(conn, str(task_row["vector"]))
+                if task_row is not None
+                else []
+            )
+        item = self._tracker_task_dict(row)
+        if task_row is not None:
+            item["reward_calculation"] = self._task_reward_calculation_dict(
+                task_row,
+                crew_bonus_details=crew_bonus_details,
+            )
+        return item
+
+    def revert_tracker_task_submission(self, task_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = self._get_tracker_task_row(conn, task_id)
+            if row is None:
+                raise EconomyError(f"Tracker task not found: {task_id}")
+            if row["status"] != TRACKER_STATUS_SUBMITTED or row["economy_task_id"] is None:
+                raise EconomyError("Tracker task is not submitted")
+            economy_task_id = int(row["economy_task_id"])
+            reverted_reward = parse_ap(row["submitted_reward"])
+            reverted_retro_bonus = parse_ap(row["submitted_retro_bonus"])
+            conn.execute(
+                "DELETE FROM transactions WHERE task_id = ?",
+                (economy_task_id,),
+            )
+            conn.execute("DELETE FROM tasks WHERE id = ?", (economy_task_id,))
+            conn.execute(
+                """
+                UPDATE tracker_tasks
+                SET status = ?, updated_at = ?, economy_task_id = NULL,
+                    submitted_reward = '0.000', submitted_retro_bonus = '0.000'
+                WHERE id = ?
+                """,
+                (TRACKER_STATUS_DONE, self._now(), task_id),
+            )
+            updated = self._get_tracker_task_row(conn, task_id)
+        item = self._tracker_task_dict(updated)
+        item.update(
+            {
+                "reverted_economy_task_id": economy_task_id,
+                "reverted_reward": db_ap(reverted_reward),
+                "reverted_retro_bonus": db_ap(reverted_retro_bonus),
+                "reverted_total": db_ap(
+                    parse_ap(reverted_reward + reverted_retro_bonus)
+                ),
+            }
+        )
+        return item
 
     def mark_task_premium_received(self, task_id: int) -> dict[str, Any]:
         with self._connect() as conn:
@@ -1149,14 +1640,21 @@ class EconomyService:
         level_after: str,
         cost: Decimal,
         cashback_eligible: bool,
+        extra_discount_rate: Decimal = Decimal("0.000"),
     ) -> UpgradeResult:
         cost = parse_ap(cost)
         cashback_level = self._get_int(conn, "cashback_level")
-        discount = self._discount(conn, cost, cashback_eligible=cashback_eligible)
+        discount = self._discount(
+            conn,
+            cost,
+            cashback_eligible=cashback_eligible,
+            extra_rate=extra_discount_rate,
+        )
         final_cost = parse_ap(cost - discount)
         note = f"{target}: {level_before} -> {level_after}"
         if discount:
-            note += f" со скидкой {cashback_level * 5}%"
+            percent = cashback_level * 5 + int(extra_discount_rate * 100)
+            note += f" со скидкой {percent}%"
         self._ensure_can_spend(conn, final_cost)
         upgrade_id = self._record_upgrade_only(
             conn,
@@ -1168,21 +1666,23 @@ class EconomyService:
             discount=discount,
             note=note,
         )
-        self._insert_transaction(
+        self._spend_ap_with_shadow(
             conn,
-            -final_cost,
+            final_cost,
             "upgrade_purchase",
             f"Покупка улучшения: {note}",
-            upgrade_id=upgrade_id,
-            real_ap_amount=-final_cost,
             source="terminal",
+            upgrade_id=upgrade_id,
         )
         return UpgradeResult(upgrade_id, upgrade_type, target, final_cost, discount)
 
     def _quote_core(self, conn: sqlite3.Connection) -> UpgradeQuote:
         current_base = self._get_decimal(conn, "base_rate")
         new_base = parse_ap(current_base + self._core_step(conn))
-        full_cost = parse_ap(current_base * CORE_COST_MULTIPLIER)
+        cost_base = current_base
+        if self._get_shop_level(conn, "noctur.core_rewrite"):
+            cost_base = self._core_shadow_base(conn, current_base)
+        full_cost = parse_ap(cost_base * CORE_COST_MULTIPLIER)
         discount = self._discount(conn, full_cost, cashback_eligible=True)
         return UpgradeQuote(
             target="core",
@@ -1211,7 +1711,13 @@ class EconomyService:
             )
         new_level = current_level + 1
         full_cost = parse_ap(Decimal(new_level) * Decimal("0.5"))
-        discount = self._discount(conn, full_cost, cashback_eligible=True)
+        crew_effects = self._active_crew_effects(conn)
+        discount = self._discount(
+            conn,
+            full_cost,
+            cashback_eligible=True,
+            extra_rate=crew_effects.vector_upgrade_discount,
+        )
         return UpgradeQuote(
             target=vector_info.key,
             level_before=current_level,
@@ -1227,8 +1733,10 @@ class EconomyService:
         cost: Decimal,
         *,
         cashback_eligible: bool,
+        extra_rate: Decimal = Decimal("0.000"),
     ) -> Decimal:
         rate = self._discount_rate(conn, cashback_eligible=cashback_eligible)
+        rate = min(rate + extra_rate, Decimal("0.95"))
         if not rate:
             return Decimal("0.000")
         return parse_ap(cost * rate)
@@ -1238,8 +1746,18 @@ class EconomyService:
         absolute_limit = self._get_shop_level(conn, "noctur.absolute_limit")
         rate = Decimal(cashback_level) * Decimal("0.05")
         rate += Decimal(absolute_limit) * Decimal("0.01")
+        if cashback_eligible and self._get_shop_level(conn, "noctur.devaluation") >= 5:
+            rate += Decimal("0.500")
         cap = min(Decimal("0.95"), Decimal("0.90") + Decimal(absolute_limit) * Decimal("0.01"))
         return min(rate, cap)
+
+    def _core_shadow_base(self, conn: sqlite3.Connection, fallback: Decimal) -> Decimal:
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'core_shadow_base'"
+        ).fetchone()
+        if row is None:
+            return parse_ap(fallback)
+        return parse_ap(row["value"])
 
     def _cashback_cost(self, current_level: int) -> Decimal:
         return parse_ap(CASHBACK_PURCHASE_BASE_COST + Decimal(current_level))
@@ -1347,32 +1865,10 @@ class EconomyService:
     def _quote_retro_buffer(self, conn: sqlite3.Connection) -> RetroBufferQuote:
         current_base = self._get_decimal(conn, "base_rate")
         limit = RETRO_BUFFER_BASE_LIMIT + 10 * self._get_shop_level(conn, "noctur.quantum_archive")
-        cleared_id = self._get_int(conn, "retro_buffer_cleared_task_id")
-        rows = conn.execute(
-            """
-            SELECT id, units, vector_multiplier, priority_multiplier,
-                full_close_bonus, catalog_weight, current_reward,
-                retro_paid_base_rate
-            FROM tasks
-            WHERE id > ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (cleared_id, limit),
-        ).fetchall()
+        rows = self._retro_buffer_rows(conn, limit=limit)
         gross = Decimal("0.000")
         for row in rows:
-            paid_base = parse_ap(row["retro_paid_base_rate"])
-            if paid_base >= current_base:
-                continue
-            gross += parse_ap(
-                Decimal(row["units"])
-                * (current_base - paid_base)
-                * parse_ap(row["vector_multiplier"])
-                * parse_ap(row["priority_multiplier"])
-                * parse_ap(row["full_close_bonus"])
-                * parse_ap(row["catalog_weight"])
-            )
+            gross += self._retro_buffer_task_delta(row, current_base)
         gross = parse_ap(gross)
         tax_bypass = self._get_shop_level(conn, "noctur.tax_bypass")
         commission = max(
@@ -1393,6 +1889,93 @@ class EconomyService:
             activation_allowed=gross > fee,
         )
 
+    def _retro_buffer_payload(self, conn: sqlite3.Connection) -> dict[str, Any]:
+        quote = self._quote_retro_buffer(conn)
+        current_base = self._get_decimal(conn, "base_rate")
+        rows = self._retro_buffer_rows(conn, limit=quote.limit)
+        shadow_multiplier = (
+            Decimal("1.500")
+            if self._get_shop_level(conn, "noctur.shadow_investment")
+            else Decimal("1.000")
+        )
+        tasks: list[dict[str, Any]] = []
+        for row in rows:
+            gross_delta = self._retro_buffer_task_delta(row, current_base)
+            fee_share = Decimal("0.000")
+            net_delta = Decimal("0.000")
+            if gross_delta and quote.gross:
+                fee_share = parse_ap(quote.fee * gross_delta / quote.gross)
+                net_delta = (
+                    parse_ap(gross_delta - fee_share)
+                    if gross_delta > fee_share
+                    else Decimal("0.000")
+                )
+                if net_delta and shadow_multiplier != Decimal("1.000"):
+                    net_delta = parse_ap(net_delta * shadow_multiplier)
+            tasks.append(
+                {
+                    "id": int(row["id"]),
+                    "created_at": row["created_at"],
+                    "category": row["category"],
+                    "title": row["title"],
+                    "units": int(row["units"]),
+                    "vector": row["vector"],
+                    "paid_base_rate": db_ap(row["retro_paid_base_rate"]),
+                    "current_base_rate": db_ap(current_base),
+                    "current_reward": db_ap(row["current_reward"]),
+                    "gross_delta": db_ap(gross_delta),
+                    "fee_share": db_ap(fee_share),
+                    "net_delta": db_ap(net_delta),
+                    "eligible": gross_delta > 0,
+                }
+            )
+        return {
+            "eligible_count": quote.eligible_count,
+            "limit": quote.limit,
+            "gross": db_ap(quote.gross),
+            "fee": db_ap(quote.fee),
+            "net": db_ap(quote.net),
+            "commission_rate": db_ap(quote.commission_rate),
+            "activation_allowed": quote.activation_allowed,
+            "tasks": tasks,
+        }
+
+    def _retro_buffer_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        cleared_id = self._get_int(conn, "retro_buffer_cleared_task_id")
+        return conn.execute(
+            """
+            SELECT id, created_at, category, title, vector, units,
+                vector_multiplier, priority_multiplier, full_close_bonus,
+                catalog_weight, crew_vector_bonus, current_reward,
+                retro_paid_base_rate
+            FROM tasks
+            WHERE id > ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (cleared_id, limit),
+        ).fetchall()
+
+    def _retro_buffer_task_delta(
+        self,
+        row: sqlite3.Row,
+        current_base: Decimal,
+    ) -> Decimal:
+        paid_base = parse_ap(row["retro_paid_base_rate"])
+        if paid_base >= current_base:
+            return Decimal("0.000")
+        return parse_ap(
+            Decimal(row["units"])
+            * (current_base - paid_base)
+            * self._task_multiplier(row)
+            * parse_ap(row["catalog_weight"])
+        )
+
     def _activate_retro_buffer(self, conn: sqlite3.Connection) -> UpgradeResult:
         quote = self._quote_retro_buffer(conn)
         if not quote.activation_allowed:
@@ -1400,31 +1983,13 @@ class EconomyService:
                 f"Retro buffer is not profitable: gross {db_ap(quote.gross)}, fee {db_ap(quote.fee)}"
             )
         current_base = self._get_decimal(conn, "base_rate")
-        rows = conn.execute(
-            """
-            SELECT id, current_reward, retro_paid_base_rate, units,
-                vector_multiplier, priority_multiplier, full_close_bonus, catalog_weight
-            FROM tasks
-            WHERE id > ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (self._get_int(conn, "retro_buffer_cleared_task_id"), quote.limit),
-        ).fetchall()
+        rows = self._retro_buffer_rows(conn, limit=quote.limit)
         max_task_id = 0
         for row in rows:
             max_task_id = max(max_task_id, int(row["id"]))
-            paid_base = parse_ap(row["retro_paid_base_rate"])
-            if paid_base >= current_base:
+            delta = self._retro_buffer_task_delta(row, current_base)
+            if not delta:
                 continue
-            delta = parse_ap(
-                Decimal(row["units"])
-                * (current_base - paid_base)
-                * parse_ap(row["vector_multiplier"])
-                * parse_ap(row["priority_multiplier"])
-                * parse_ap(row["full_close_bonus"])
-                * parse_ap(row["catalog_weight"])
-            )
             conn.execute(
                 """
                 UPDATE tasks
@@ -1467,7 +2032,7 @@ class EconomyService:
         rows = conn.execute(
             """
             SELECT id, category, title, units, vector_multiplier, priority_multiplier,
-                full_close_bonus, catalog_weight, current_reward,
+                full_close_bonus, catalog_weight, crew_vector_bonus, current_reward,
                 retro_paid_base_rate
             FROM tasks
             WHERE id != ?
@@ -1485,9 +2050,7 @@ class EconomyService:
             delta = parse_ap(
                 Decimal(row["units"])
                 * (current_base - paid_base)
-                * parse_ap(row["vector_multiplier"])
-                * parse_ap(row["priority_multiplier"])
-                * parse_ap(row["full_close_bonus"])
+                * self._task_multiplier(row)
                 * parse_ap(row["catalog_weight"])
             )
             if not delta:
@@ -1599,35 +2162,14 @@ class EconomyService:
         if not amount:
             return
         if currency == AP:
-            real_balance = self._balance(conn, AP)
-            real_spend = min(real_balance, amount)
-            shadow_spend = parse_ap(amount - real_spend)
-            if shadow_spend and self._balance(conn, SHADOW_AP) < shadow_spend:
-                raise InsufficientBalanceError(
-                    f"Not enough AP: need {db_ap(amount)}, balance {db_ap(real_balance)}"
-                )
-            if real_spend:
-                self._insert_transaction(
-                    conn,
-                    -real_spend,
-                    "shop_purchase",
-                    note,
-                    currency=AP,
-                    source="shop",
-                    purchase_id=purchase_id,
-                    real_ap_amount=-real_spend,
-                )
-            if shadow_spend:
-                self._insert_transaction(
-                    conn,
-                    -shadow_spend,
-                    "shop_purchase",
-                    note,
-                    currency=SHADOW_AP,
-                    source="shop",
-                    purchase_id=purchase_id,
-                    shadow_ap_amount=-shadow_spend,
-                )
+            self._spend_ap_with_shadow(
+                conn,
+                amount,
+                "shop_purchase",
+                note,
+                source="shop",
+                purchase_id=purchase_id,
+            )
             return
         if self._balance(conn, currency) < amount:
             raise InsufficientBalanceError(
@@ -1642,6 +2184,53 @@ class EconomyService:
             source="shop",
             purchase_id=purchase_id,
         )
+
+    def _spend_ap_with_shadow(
+        self,
+        conn: sqlite3.Connection,
+        amount: Decimal,
+        kind: str,
+        note: str,
+        *,
+        source: str,
+        upgrade_id: int | None = None,
+        purchase_id: int | None = None,
+    ) -> tuple[Decimal, Decimal]:
+        amount = parse_ap(amount)
+        real_balance = self._balance(conn, AP)
+        shadow_balance = self._balance(conn, SHADOW_AP)
+        real_spend = min(max(real_balance, Decimal("0.000")), amount)
+        shadow_spend = parse_ap(amount - real_spend)
+        if shadow_spend and shadow_balance < shadow_spend:
+            total = parse_ap(real_balance + shadow_balance)
+            raise InsufficientBalanceError(
+                f"Not enough AP: need {db_ap(amount)}, balance {db_ap(total)}"
+            )
+        if real_spend:
+            self._insert_transaction(
+                conn,
+                -real_spend,
+                kind,
+                note,
+                currency=AP,
+                source=source,
+                upgrade_id=upgrade_id,
+                purchase_id=purchase_id,
+                real_ap_amount=-real_spend,
+            )
+        if shadow_spend:
+            self._insert_transaction(
+                conn,
+                -shadow_spend,
+                kind,
+                note,
+                currency=SHADOW_AP,
+                source=source,
+                upgrade_id=upgrade_id,
+                purchase_id=purchase_id,
+                shadow_ap_amount=-shadow_spend,
+            )
+        return real_spend, shadow_spend
 
     def _shop_quote_payload(self, quote: ShopQuote) -> dict[str, Any]:
         return {
@@ -1710,6 +2299,10 @@ class EconomyService:
             reason = "cashback is maxed" if not available else ""
             full_cost = self._cashback_cost(current)
             metadata = {"level_before": current, "level_after": min(CASHBACK_MAX_LEVEL, current + 1)}
+        elif item.key == "genesis.rank_change":
+            available = False
+            reason = "use the crew promotion action"
+            full_cost = Decimal("0.000")
         elif item.cost_formula == "retro_buffer":
             retro = self._quote_retro_buffer(conn)
             full_cost = retro.fee
@@ -1750,7 +2343,7 @@ class EconomyService:
             metadata = {"level_before": current, "level_after": current + quantity}
         elif item.cost_formula == "prime":
             loyalty = self._get_int(conn, "prime_loyalty_weeks")
-            full_cost = parse_ap(max(Decimal("6.000"), Decimal("10.000") - Decimal(loyalty)) * quantity)
+            full_cost = parse_ap(max(Decimal("10.000"), Decimal("20.000") - Decimal(loyalty)) * quantity)
         elif item.cost_formula == "rollback_posts":
             posts = int(options.get("posts", quantity))
             if posts <= 4:
@@ -1774,9 +2367,14 @@ class EconomyService:
             full_cost = parse_ap(Decimal(str(options.get("setting_cost", 0))) * Decimal("4.000"))
 
         full_cost = parse_ap(full_cost)
-        discount = self._shop_discount(conn, item.key, target, full_cost, currency)
+        crew_effects = self._active_crew_effects(conn)
+        if item.key in crew_effects.free_shop_items:
+            discount = full_cost
+            final_cost = Decimal("0.000")
+            return ShopQuote(item.key, item.title, item.section, target, quantity, currency, full_cost, discount, final_cost, available, reason, metadata)
+        discount = self._shop_discount(conn, item.key, target, full_cost, currency, crew_effects=crew_effects)
         final_cost = parse_ap(full_cost - discount)
-        if currency == AP and final_cost and final_cost < Decimal("0.100"):
+        if currency == AP and full_cost and final_cost < Decimal("0.100"):
             final_cost = Decimal("0.100")
             discount = parse_ap(full_cost - final_cost)
         return ShopQuote(item.key, item.title, item.section, target, quantity, currency, full_cost, discount, final_cost, available, reason, metadata)
@@ -1788,14 +2386,251 @@ class EconomyService:
         target: str,
         full_cost: Decimal,
         currency: str,
+        crew_effects: CrewEffects | None = None,
     ) -> Decimal:
         if currency != AP or not full_cost:
             return Decimal("0.000")
+        crew_effects = crew_effects or self._active_crew_effects(conn)
         target_key = target or item_key
         target_discount = Decimal(self._get_target_discount(conn, target_key)) * Decimal("0.05")
-        rate = target_discount + Decimal(self._get_shop_level(conn, "noctur.absolute_limit")) * Decimal("0.01")
+        item = require_shop_item(item_key)
+        rate = target_discount + self._global_shop_discount_rate(conn, item)
+        rate += crew_effects.shop_percent_discount.get(item.key, Decimal("0.000"))
+        rate += Decimal(self._get_shop_level(conn, "noctur.absolute_limit")) * Decimal("0.01")
         cap = Decimal("0.95") if self._get_shop_level(conn, "noctur.absolute_limit") else Decimal("0.90")
-        return parse_ap(full_cost * min(rate, cap))
+        percent_discount = parse_ap(full_cost * min(rate, cap))
+        crew_discount = crew_effects.shop_flat_discount.get(item.key, Decimal("0.000"))
+        return parse_ap(min(full_cost, percent_discount + crew_discount))
+
+    def _global_shop_discount_rate(self, conn: sqlite3.Connection, item: Any) -> Decimal:
+        level = min(self._get_shop_level(conn, "noctur.devaluation"), 5)
+        if not level:
+            return Decimal("0.000")
+        if item.key in {"terminal.core", "terminal.vector"}:
+            return Decimal("0.500") if level >= 5 else Decimal("0.000")
+        route_items = {
+            "expedition.target_request",
+            "expedition.ng",
+            "expedition.ng_plus",
+            "expedition.hijack",
+            "expedition.isolated_singularity",
+        }
+        if item.section in {"world", "recreation"} or item.key in route_items or item.key == "prime.subscription":
+            return Decimal(level) * Decimal("0.100")
+        return Decimal("0.000")
+
+    def _active_crew_effects(self, conn: sqlite3.Connection) -> CrewEffects:
+        rows = conn.execute(
+            """
+            SELECT rank, sedative_dose, tags, full_tags, dominants
+            FROM cabins
+            WHERE active = 1
+            """
+        ).fetchall()
+        base_rate_bonus = Decimal("0.000")
+        vector_bonus: dict[str, Decimal] = {}
+        full_close_bonus = Decimal("0.000")
+        shop_flat_discount: dict[str, Decimal] = {}
+        shop_percent_discount: dict[str, Decimal] = {}
+        vector_upgrade_discount = Decimal("0.000")
+        free_shop_items: set[str] = set()
+        tag_counts: dict[str, int] = {}
+
+        for row in rows:
+            for tag in self._crew_tags(row["tags"], row["full_tags"]):
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            coefficient = self._crew_efficiency(row["rank"], row["sedative_dose"])
+            for dominant in self._dominant_traits(row["dominants"]):
+                name = self._normalize_trait_name(dominant["name"])
+                level = dominant["level"]
+                if name in {"суб-администратор", "аналитика / кодинг", "аналитика", "кодинг"}:
+                    bonus = self._scaled_percent(self._level_value(level, ("0.10", "0.15", "0.20", "0.30", "0.40")), coefficient)
+                    vector_bonus["code"] = parse_ap(vector_bonus.get("code", Decimal("0.000")) + bonus)
+                elif name in {"скорость вспышки", "вдохновительница"}:
+                    base_rate_bonus += self._scaled_percent(self._level_value(level, ("0.02", "0.04", "0.06", "0.08", "0.10")), coefficient)
+                elif name == "чтение ауры":
+                    full_close_bonus += self._scaled_percent(Decimal("0.03") * level, coefficient)
+                elif name == "мимикрия днк":
+                    discount = self._scaled_flat_ap(Decimal("0.5") * level, coefficient)
+                    shop_flat_discount["world.infiltrator"] = max(
+                        shop_flat_discount.get("world.infiltrator", Decimal("0.000")),
+                        discount,
+                    )
+                elif name == "эмпатия":
+                    discount = self._scaled_flat_ap(self._level_value(level, ("0.1", "0.2", "0.3")), coefficient)
+                    shop_flat_discount["world.infiltrator"] = max(
+                        shop_flat_discount.get("world.infiltrator", Decimal("0.000")),
+                        discount,
+                    )
+                elif name == "блокировка точек":
+                    discount = self._scaled_flat_ap(Decimal("0.2") * level, coefficient)
+                    shop_flat_discount["world.skip"] = max(
+                        shop_flat_discount.get("world.skip", Decimal("0.000")),
+                        discount,
+                    )
+
+        if self._tag_count(tag_counts, "киберпространство", "sci-fi", "scifi") >= 3:
+            vector_upgrade_discount = max(vector_upgrade_discount, Decimal("0.150"))
+        if self._tag_count(tag_counts, "фэнтези", "фентези", "магия") >= 3:
+            for item_key in ("world.adaptation", "world.prerequisite"):
+                shop_percent_discount[item_key] = max(
+                    shop_percent_discount.get(item_key, Decimal("0.000")),
+                    Decimal("0.300"),
+                )
+        if self._tag_count(tag_counts, "эрудит", "эрудиция") >= 3:
+            free_shop_items.add("expedition.intel")
+        if self._tag_count(tag_counts, "нестабильность") >= 3:
+            full_close_bonus += Decimal("0.300")
+        if self._tag_count(tag_counts, "постапокалипсис", "выживание") >= 3:
+            shop_percent_discount["hub.extractor"] = max(
+                shop_percent_discount.get("hub.extractor", Decimal("0.000")),
+                Decimal("0.500"),
+            )
+
+        return CrewEffects(
+            base_rate_bonus=parse_ap(base_rate_bonus),
+            vector_bonus={key: parse_ap(value) for key, value in vector_bonus.items()},
+            full_close_bonus=parse_ap(full_close_bonus),
+            shop_flat_discount={key: parse_ap(value) for key, value in shop_flat_discount.items()},
+            shop_percent_discount={
+                key: parse_ap(value) for key, value in shop_percent_discount.items()
+            },
+            vector_upgrade_discount=parse_ap(vector_upgrade_discount),
+            free_shop_items=frozenset(free_shop_items),
+        )
+
+    def _crew_task_bonus_details(
+        self,
+        conn: sqlite3.Connection,
+        vector: str,
+    ) -> list[dict[str, str]]:
+        rows = conn.execute(
+            """
+            SELECT name, rank, sedative_dose, dominants
+            FROM cabins
+            WHERE active = 1
+            """
+        ).fetchall()
+        details: list[dict[str, str]] = []
+        for row in rows:
+            cap = self._crew_efficiency_cap(row["rank"])
+            sedative = parse_ap(row["sedative_dose"])
+            coefficient = self._crew_efficiency(row["rank"], sedative)
+            cap_percent = parse_ap(cap * Decimal("100"))
+            for dominant in self._dominant_traits(row["dominants"]):
+                name = self._normalize_trait_name(dominant["name"])
+                level = dominant["level"]
+                kind = ""
+                label = ""
+                nominal = Decimal("0.000")
+                if name in {"суб-администратор", "аналитика / кодинг", "аналитика", "кодинг"}:
+                    if vector != "code":
+                        continue
+                    kind = "vector"
+                    label = "Вектор"
+                    nominal = self._level_value(level, ("0.10", "0.15", "0.20", "0.30", "0.40"))
+                elif name in {"скорость вспышки", "вдохновительница"}:
+                    kind = "base_rate"
+                    label = "База"
+                    nominal = self._level_value(level, ("0.02", "0.04", "0.06", "0.08", "0.10"))
+                elif name == "чтение ауры":
+                    kind = "full_close"
+                    label = "Полное закрытие"
+                    nominal = Decimal("0.03") * level
+                if not kind:
+                    continue
+                amount = self._scaled_percent(nominal, coefficient)
+                details.append(
+                    {
+                        "kind": kind,
+                        "label": label,
+                        "source": str(row["name"]),
+                        "trait": dominant["name"],
+                        "nominal": db_ap(nominal),
+                        "cap_percent": db_ap(cap_percent),
+                        "sedative_percent": db_ap(sedative),
+                        "amount": db_ap(amount),
+                        "formula": (
+                            f"{format_ap(nominal)} * "
+                            f"({format_ap(cap_percent)} - {format_ap(sedative)} СД)%"
+                            f" = {format_ap(amount)}"
+                        ),
+                    }
+                )
+        return details
+
+    def _crew_tags(self, tags: str | None, full_tags: str | None) -> list[str]:
+        raw = tags or full_tags or ""
+        bracketed = re.findall(r"\[([^\]]+)\]", raw)
+        parts = bracketed or re.split(r"[,;/]", raw)
+        normalized: list[str] = []
+        for part in parts:
+            tag = self._normalize_trait_name(str(part))
+            if tag:
+                normalized.append(tag)
+        return normalized
+
+    def _tag_count(self, counts: dict[str, int], *tags: str) -> int:
+        return sum(counts.get(self._normalize_trait_name(tag), 0) for tag in tags)
+
+    def _dominant_traits(self, raw: str) -> list[dict[str, Any]]:
+        try:
+            parsed = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        traits = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                level = int(item.get("level", 1))
+            except (TypeError, ValueError):
+                level = 1
+            traits.append({"name": name, "level": max(1, level)})
+        return traits
+
+    def _crew_efficiency(self, rank: str, sedative_dose: Decimal | int | str) -> Decimal:
+        cap = self._crew_efficiency_cap(rank)
+        sedative = parse_ap(sedative_dose) / Decimal("100")
+        return max(Decimal("0.000"), parse_ap(cap - sedative))
+
+    def _crew_efficiency_cap(self, rank: str) -> Decimal:
+        normalized_rank = str(rank).strip().lower().replace("[", "").replace("]", "")
+        if normalized_rank.startswith("sr"):
+            return Decimal("1.500")
+        elif normalized_rank.startswith("s"):
+            return Decimal("1.300")
+        elif normalized_rank.startswith("a"):
+            return Decimal("1.100")
+        elif normalized_rank.startswith("e"):
+            return Decimal("0.800")
+        return Decimal("1.000")
+
+    def _normalize_trait_name(self, name: str) -> str:
+        return (
+            name.strip()
+            .lower()
+            .replace("ё", "е")
+            .removeprefix("[")
+            .removesuffix("]")
+            .strip()
+        )
+
+    def _level_value(self, level: int, values: tuple[str, ...]) -> Decimal:
+        index = min(max(level, 1), len(values)) - 1
+        return Decimal(values[index])
+
+    def _scaled_percent(self, value: Decimal, coefficient: Decimal) -> Decimal:
+        return parse_ap(value * coefficient)
+
+    def _scaled_flat_ap(self, value: Decimal, coefficient: Decimal) -> Decimal:
+        scaled = value * coefficient
+        return scaled.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
     def _insert_shop_purchase(self, conn: sqlite3.Connection, quote: ShopQuote, note: str) -> int:
         cur = conn.execute(
@@ -1856,6 +2691,8 @@ class EconomyService:
             )
         if item.effect_kind == "prime_extend":
             self._set_meta(conn, "prime_active", "1")
+            if not self._get_meta(conn, "prime_active_since"):
+                self._set_meta(conn, "prime_active_since", self._now()[:10])
             self._set_meta(
                 conn,
                 "prime_weeks_purchased",
@@ -1922,6 +2759,43 @@ class EconomyService:
         item = dict(row)
         return item
 
+    def _history_purchase_entry(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": f"purchase:{row['id']}",
+            "kind": "purchase",
+            "created_at": row["created_at"],
+            "title": row["title"],
+            "section": row["section"],
+            "amount": db_ap(row["final_cost"]),
+            "currency": row["currency"],
+            "target": row["target"],
+            "note": row["note"],
+            "purchase_id": int(row["id"]),
+            "tracker_task_id": None,
+            "economy_task_id": None,
+            "revertible": False,
+        }
+
+    def _history_task_submission_entry(self, row: sqlite3.Row) -> dict[str, Any]:
+        reward = parse_ap(row["submitted_reward"])
+        retro_bonus = parse_ap(row["submitted_retro_bonus"])
+        amount = parse_ap(reward + retro_bonus)
+        return {
+            "id": f"task_submit:{row['id']}",
+            "kind": "task_submit",
+            "created_at": row["updated_at"],
+            "title": self._format_task_name(str(row["category"]), str(row["title"])),
+            "section": "task",
+            "amount": db_ap(amount),
+            "currency": AP,
+            "target": f"task:{row['id']}",
+            "note": "",
+            "purchase_id": None,
+            "tracker_task_id": int(row["id"]),
+            "economy_task_id": int(row["economy_task_id"]),
+            "revertible": True,
+        }
+
     def _shop_level_key(self, item_key: str, target: str = "") -> str:
         return f"{item_key}:{target.strip()}" if target.strip() else item_key
 
@@ -1977,6 +2851,21 @@ class EconomyService:
         title = title.strip()
         return f"{category}: {title}" if category else title
 
+    def _get_task_row(
+        self, conn: sqlite3.Connection, task_id: int
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT id, created_at, category, title, vector, units, base_rate,
+                vector_level, vector_multiplier, priority_multiplier,
+                full_close_bonus, catalog_weight, crew_vector_bonus,
+                reward, current_reward, retro_paid_base_rate, premium_received, note
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+
     def _get_tracker_task_row(
         self, conn: sqlite3.Connection, task_id: int
     ) -> sqlite3.Row | None:
@@ -1996,6 +2885,63 @@ class EconomyService:
         item["submitted"] = item["status"] == TRACKER_STATUS_SUBMITTED
         return item
 
+    def _task_multiplier(self, row: sqlite3.Row | dict[str, Any]) -> Decimal:
+        return parse_ap(
+            parse_ap(row["vector_multiplier"])
+            * parse_ap(row["priority_multiplier"])
+            * parse_ap(row["full_close_bonus"])
+        )
+
+    def _task_reward_calculation_dict(
+        self,
+        row: sqlite3.Row | dict[str, Any],
+        *,
+        crew_bonus_details: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        units = int(row["units"])
+        base_rate = parse_ap(row["base_rate"])
+        core_base_rate = parse_ap(row["retro_paid_base_rate"])
+        crew_base_bonus = parse_ap(base_rate - core_base_rate)
+        catalog_weight = parse_ap(row["catalog_weight"])
+        vector_multiplier = parse_ap(row["vector_multiplier"])
+        crew_vector_bonus = parse_ap(row["crew_vector_bonus"])
+        purchased_vector_multiplier = parse_ap(vector_multiplier - crew_vector_bonus)
+        priority_multiplier = parse_ap(row["priority_multiplier"])
+        full_close_bonus = parse_ap(row["full_close_bonus"])
+        base_catalog_total = parse_ap(Decimal(units) * base_rate * catalog_weight)
+        base_vector_total = parse_ap(
+            base_catalog_total * vector_multiplier * priority_multiplier
+        )
+        full_close_premium = (
+            parse_ap(base_vector_total * (full_close_bonus - Decimal("1.000")))
+            if full_close_bonus > Decimal("1.000")
+            else Decimal("0.000")
+        )
+        reward = parse_ap(row["reward"])
+        return {
+            "units": units,
+            "base_rate": db_ap(base_rate),
+            "core_base_rate": db_ap(core_base_rate),
+            "crew_base_bonus": db_ap(crew_base_bonus),
+            "catalog_weight": db_ap(catalog_weight),
+            "purchased_vector_multiplier": db_ap(purchased_vector_multiplier),
+            "vector_multiplier": db_ap(vector_multiplier),
+            "priority_multiplier": db_ap(priority_multiplier),
+            "full_close_bonus": db_ap(full_close_bonus),
+            "crew_vector_bonus": db_ap(crew_vector_bonus),
+            "base_catalog_total": db_ap(base_catalog_total),
+            "base_vector_total": db_ap(base_vector_total),
+            "full_close_premium": db_ap(full_close_premium),
+            "reward": db_ap(reward),
+            "crew_bonus_details": crew_bonus_details or [],
+            "formula": (
+                f"{units} * ({db_ap(core_base_rate)} + {db_ap(crew_base_bonus)})"
+                f" * {db_ap(catalog_weight)} * "
+                f"({db_ap(purchased_vector_multiplier)} + {db_ap(crew_vector_bonus)})"
+                f" * {db_ap(priority_multiplier)}"
+            ),
+        }
+
     def _format_reward_formula(self, parts: dict[Decimal, int], total: Decimal) -> str:
         terms = []
         for reward, count in sorted(parts.items()):
@@ -2006,7 +2952,7 @@ class EconomyService:
         return f"{' + '.join(terms)} = {db_ap(total).rstrip('0').rstrip('.')}"
 
     def _ensure_can_spend(self, conn: sqlite3.Connection, amount: Decimal) -> None:
-        balance = self._balance(conn, AP)
+        balance = parse_ap(self._balance(conn, AP) + self._balance(conn, SHADOW_AP))
         if parse_ap(balance - amount) < 0:
             raise InsufficientBalanceError(
                 f"Not enough AP: need {db_ap(amount)}, balance {db_ap(balance)}"
@@ -2100,6 +3046,7 @@ class EconomyService:
                 priority_multiplier TEXT NOT NULL,
                 full_close_bonus TEXT NOT NULL,
                 catalog_weight TEXT NOT NULL,
+                crew_vector_bonus TEXT NOT NULL DEFAULT '0.000',
                 reward TEXT NOT NULL,
                 current_reward TEXT NOT NULL,
                 retro_paid_base_rate TEXT NOT NULL,
@@ -2193,10 +3140,19 @@ class EconomyService:
             CREATE TABLE IF NOT EXISTS cabins (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
+                sample_code TEXT NOT NULL DEFAULT '',
                 name TEXT NOT NULL,
+                universe TEXT NOT NULL DEFAULT '',
                 rank TEXT NOT NULL DEFAULT 'C',
                 tags TEXT NOT NULL DEFAULT '',
+                full_tags TEXT NOT NULL DEFAULT '',
                 sedative_dose TEXT NOT NULL DEFAULT '0.000',
+                upkeep TEXT NOT NULL DEFAULT '0.000',
+                subscription_tier TEXT NOT NULL DEFAULT '',
+                subscription_started_at TEXT NOT NULL DEFAULT '',
+                recessive_name TEXT NOT NULL DEFAULT '',
+                recessive_description TEXT NOT NULL DEFAULT '',
+                dominants TEXT NOT NULL DEFAULT '[]',
                 active INTEGER NOT NULL DEFAULT 1,
                 note TEXT NOT NULL DEFAULT ''
             );
@@ -2230,6 +3186,13 @@ class EconomyService:
                 "category",
                 "ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT ''",
             )
+        if "crew_vector_bonus" not in task_columns:
+            self._add_column_if_missing(
+                conn,
+                "tasks",
+                "crew_vector_bonus",
+                "ALTER TABLE tasks ADD COLUMN crew_vector_bonus TEXT NOT NULL DEFAULT '0.000'",
+            )
         transaction_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
         }
@@ -2243,8 +3206,128 @@ class EconomyService:
             if column not in transaction_columns:
                 self._add_column_if_missing(conn, "transactions", column, statement)
         conn.execute("UPDATE transactions SET currency = 'ap' WHERE currency = '' OR currency IS NULL")
+        cabin_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(cabins)").fetchall()
+        }
+        for column, statement in {
+            "sample_code": "ALTER TABLE cabins ADD COLUMN sample_code TEXT NOT NULL DEFAULT ''",
+            "universe": "ALTER TABLE cabins ADD COLUMN universe TEXT NOT NULL DEFAULT ''",
+            "full_tags": "ALTER TABLE cabins ADD COLUMN full_tags TEXT NOT NULL DEFAULT ''",
+            "upkeep": "ALTER TABLE cabins ADD COLUMN upkeep TEXT NOT NULL DEFAULT '0.000'",
+            "subscription_tier": "ALTER TABLE cabins ADD COLUMN subscription_tier TEXT NOT NULL DEFAULT ''",
+            "subscription_started_at": "ALTER TABLE cabins ADD COLUMN subscription_started_at TEXT NOT NULL DEFAULT ''",
+            "recessive_name": "ALTER TABLE cabins ADD COLUMN recessive_name TEXT NOT NULL DEFAULT ''",
+            "recessive_description": "ALTER TABLE cabins ADD COLUMN recessive_description TEXT NOT NULL DEFAULT ''",
+            "dominants": "ALTER TABLE cabins ADD COLUMN dominants TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if column not in cabin_columns:
+                self._add_column_if_missing(conn, "cabins", column, statement)
+        conn.execute("UPDATE cabins SET full_tags = tags WHERE full_tags = ''")
         self._backfill_task_categories(conn)
         self._sync_task_categories(conn)
+
+    def _crew_upkeep_discount_rate(self, conn: sqlite3.Connection) -> Decimal:
+        return PRIME_UPKEEP_DISCOUNT_RATE if self._get_bool(conn, "prime_active") else Decimal("0.000")
+
+    def _cabin_upkeep(
+        self,
+        row: sqlite3.Row,
+        discount_rate: Decimal,
+    ) -> dict[str, Decimal]:
+        base = parse_ap(row["upkeep"] or "0.000")
+        discount = parse_ap(base * discount_rate)
+        effective = parse_ap(base - discount)
+        return {
+            "base": base,
+            "discount": discount,
+            "effective": effective,
+        }
+
+    def _cabin_dict(self, conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        upkeep = self._cabin_upkeep(row, self._crew_upkeep_discount_rate(conn))
+        item["base_upkeep"] = db_ap(upkeep["base"])
+        item["upkeep_discount"] = db_ap(upkeep["discount"])
+        item["effective_upkeep"] = db_ap(upkeep["effective"])
+        item["dominant_max_level"] = self._dominant_max_level(conn, row["rank"])
+        item["sr_promotion"] = self._quote_cabin_sr_promotion(conn, row)
+        return item
+
+    def _dominant_max_level(self, conn: sqlite3.Connection, rank: str) -> int:
+        normalized = str(rank).strip().lower().replace("[", "").replace("]", "")
+        if normalized.startswith("sr"):
+            base = 4
+        elif normalized.startswith("s"):
+            base = 3
+        elif normalized.startswith("a"):
+            base = 2
+        else:
+            base = 1
+        return base + (1 if self._get_bool(conn, "prime_active") else 0)
+
+    def _quote_cabin_sr_promotion(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        cost = self._sr_subscription_cost(conn)
+        base = {
+            "available": False,
+            "reason": "",
+            "cost": db_ap(cost),
+            "currency": AP,
+            "required_dominant_level": SR_REQUIRED_DOMINANT_LEVEL,
+        }
+        rank = str(row["rank"] or "").strip().lower()
+        if rank != "s":
+            return {**base, "reason": "rank must be S"}
+        if str(row["recessive_name"] or "").strip():
+            return {**base, "reason": "recessive marker must be destroyed"}
+        traits = self._dominant_traits(row["dominants"])
+        if len(traits) < 3:
+            return {**base, "reason": "three dominant traits are required"}
+        if any(int(trait["level"]) < SR_REQUIRED_DOMINANT_LEVEL for trait in traits):
+            return {**base, "reason": f"all dominants must be level {SR_REQUIRED_DOMINANT_LEVEL}"}
+        balance = parse_ap(self._balance(conn, AP) + self._balance(conn, SHADOW_AP))
+        if balance < cost:
+            return {**base, "reason": "not enough AP or shadow AP"}
+        return {**base, "available": True, "reason": ""}
+
+    def _sr_subscription_cost(self, conn: sqlite3.Connection) -> Decimal:
+        discount = self._crew_upkeep_discount_rate(conn)
+        return parse_ap(SR_UPKEEP - parse_ap(SR_UPKEEP * discount))
+
+    def _dominants_json(
+        self,
+        dominants: list[dict[str, Any]] | str | None,
+        *,
+        max_level: int | None = None,
+    ) -> str:
+        if dominants is None:
+            return "[]"
+        if isinstance(dominants, str):
+            if max_level is None:
+                return dominants.strip() or "[]"
+            return self._dominants_json(
+                self._dominant_traits(dominants),
+                max_level=max_level,
+            )
+        normalized = []
+        for dominant in dominants:
+            name = str(dominant.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                level = int(dominant.get("level", 1))
+            except (TypeError, ValueError):
+                level = 1
+            level = max(1, level)
+            if max_level is not None and level > max_level:
+                raise ValueError(
+                    f"dominant level must not exceed {max_level} for this rank"
+                )
+            normalized.append({"name": name, "level": level})
+        return json.dumps(normalized, ensure_ascii=False)
 
     def _backfill_task_categories(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
@@ -2299,6 +3382,7 @@ class EconomyService:
             "retroactive_indexing_enabled": "0",
             "retro_buffer_cleared_task_id": "0",
             "prime_active": "0",
+            "prime_active_since": "",
             "prime_weeks_purchased": "0",
             "prime_loyalty_weeks": "0",
             "neural_shard_pity": "0",

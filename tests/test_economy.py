@@ -218,6 +218,39 @@ class EconomyServiceTests(unittest.TestCase):
         self.assertEqual(Decimal(original_task["reward"]), Decimal("8.000"))
         self.assertEqual(Decimal(original_task["current_reward"]), Decimal("10.000"))
 
+    def test_retro_buffer_lists_taxed_tasks_and_burns_after_activation(self) -> None:
+        service = self.make_service()
+        service.add_income(Decimal("60"), "Старт")
+        service.complete_task(title="Первый таск", vector="code", units=40)
+        service.buy_core()
+
+        buffer = service.get_retro_buffer()
+
+        self.assertEqual(buffer["eligible_count"], 1)
+        self.assertEqual(buffer["gross"], "2.000")
+        self.assertEqual(buffer["fee"], "1.000")
+        self.assertEqual(buffer["net"], "1.000")
+        self.assertTrue(buffer["activation_allowed"])
+        self.assertEqual(buffer["tasks"][0]["gross_delta"], "2.000")
+        self.assertEqual(buffer["tasks"][0]["fee_share"], "1.000")
+        self.assertEqual(buffer["tasks"][0]["net_delta"], "1.000")
+
+        service.buy_retroactive_indexing()
+
+        burned = service.get_retro_buffer()
+        self.assertEqual(burned["eligible_count"], 0)
+        self.assertEqual(burned["tasks"], [])
+
+    def test_prestige_resets_fact_ap_and_clears_retro_buffer_start(self) -> None:
+        service = self.make_service()
+        service.complete_task(title="Старая задача", vector="code", units=10)
+
+        prestige = service.run_prestige()
+
+        self.assertEqual(prestige["refund_currency"], "shadow_ap")
+        self.assertEqual(service.get_wallet()["currencies"]["ap"], "0.000")
+        self.assertEqual(service.get_retro_buffer()["tasks"], [])
+
     def test_shop_quote_and_purchase_record_history(self) -> None:
         service = self.make_service()
         service.add_income(Decimal("20"), "Старт")
@@ -233,7 +266,7 @@ class EconomyServiceTests(unittest.TestCase):
 
     def test_noctur_shard_purchase_and_prime_purchase_use_new_wallets(self) -> None:
         service = self.make_service()
-        service.add_income(Decimal("12"), "Старт")
+        service.add_income(Decimal("25"), "Старт")
         with service._connect() as conn:
             service._insert_transaction(
                 conn,
@@ -247,10 +280,398 @@ class EconomyServiceTests(unittest.TestCase):
         prime = service.buy_shop_item("prime.subscription")
 
         self.assertEqual(noctur["currency"], "singularity_shard")
-        self.assertEqual(prime["final_cost"], "10.000")
+        self.assertEqual(prime["final_cost"], "20.000")
         wallet = service.get_wallet()["currencies"]
         self.assertEqual(wallet["singularity_shard"], "0.000")
-        self.assertEqual(wallet["ap"], "2.000")
+        self.assertEqual(wallet["ap"], "5.000")
+
+    def test_shop_catalog_exposes_shop_35_noctur_rebalance(self) -> None:
+        service = self.make_service()
+        catalog = {item["key"]: item for item in service.list_shop_catalog()}
+
+        self.assertEqual(catalog["terminal.cashback"]["section"], "legacy")
+        self.assertEqual(catalog["hub.optimization"]["section"], "legacy")
+        self.assertEqual(catalog["noctur.cascade"]["section"], "legacy")
+        self.assertEqual(catalog["noctur.absolute_limit"]["section"], "legacy")
+        self.assertEqual(catalog["noctur.devaluation"]["section"], "noctur")
+        self.assertEqual(catalog["noctur.devaluation"]["base_cost"], "2.000")
+        self.assertEqual(catalog["noctur.shadow_investment"]["base_cost"], "6.000")
+        self.assertEqual(catalog["noctur.quantum_archive"]["base_cost"], "1.000")
+        self.assertEqual(catalog["noctur.author_right"]["title"], "Право Редактора")
+
+    def test_shop_35_devaluation_discount_applies_to_global_shop_items(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_shop_level(conn, "noctur.devaluation", 3)
+
+        prime = service.quote_shop_purchase("prime.subscription")
+        target_world = service.quote_shop_purchase("expedition.target_request")
+        hub = service.quote_shop_purchase("hub.scanning")
+
+        self.assertEqual(prime["full_cost"], "20.000")
+        self.assertEqual(prime["discount"], "6.000")
+        self.assertEqual(prime["final_cost"], "14.000")
+        self.assertEqual(target_world["final_cost"], "2.100")
+        self.assertEqual(hub["final_cost"], "10.000")
+
+    def test_shop_35_core_rewrite_uses_shadow_base_for_future_core_costs(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_shop_level(conn, "noctur.core_rewrite", 1)
+
+        first = service.quote_core_upgrade()
+        service.add_income(Decimal("20"), "Старт")
+        service.buy_core()
+        second = service.quote_core_upgrade()
+
+        self.assertEqual(first.full_cost, Decimal("2.000"))
+        self.assertEqual(first.level_after, Decimal("0.300"))
+        self.assertEqual(second.full_cost, Decimal("2.500"))
+        self.assertEqual(second.level_before, Decimal("0.300"))
+        self.assertEqual(second.level_after, Decimal("0.400"))
+
+    def test_crew_samples_store_traits_and_can_be_managed(self) -> None:
+        service = self.make_service()
+
+        cabin = service.create_cabin(
+            sample_code="01",
+            name="Химико Тога",
+            universe="BnHA",
+            rank="S",
+            tags="[Современность], [Авангард], [Нестабильность]",
+            full_tags="[Современность], [Авангард], [Нестабильность]",
+            sedative_dose="37",
+            upkeep="1.2",
+            subscription_tier="S",
+            subscription_started_at="2026-05-13",
+            recessive_name="Кровавая Ревность",
+            recessive_description="Изоляция каюты стоит 10 AP.",
+            dominants=[
+                {"name": "Мимикрия ДНК", "level": 1},
+                {"name": "Жажда Крови", "level": 1},
+            ],
+            note="ASSIR PRIME upkeep.",
+        )
+
+        self.assertEqual(cabin["sample_code"], "01")
+        self.assertEqual(cabin["sedative_dose"], "37.000")
+        self.assertEqual(cabin["base_upkeep"], "1.200")
+        self.assertEqual(cabin["effective_upkeep"], "1.200")
+        self.assertEqual(cabin["subscription_tier"], "S")
+        self.assertIn("Мимикрия ДНК", cabin["dominants"])
+
+        updated = service.update_cabin(
+            cabin["id"],
+            rank="SR",
+            dominants=[{"name": "Мимикрия ДНК", "level": 2}],
+            active=False,
+        )
+
+        self.assertEqual(updated["rank"], "SR")
+        self.assertEqual(updated["active"], 0)
+        self.assertIn('"level": 2', updated["dominants"])
+        self.assertEqual(len(service.list_cabins()), 1)
+
+        deleted = service.delete_cabin(cabin["id"])
+        self.assertEqual(deleted["name"], "Химико Тога")
+        self.assertEqual(service.list_cabins(), [])
+
+    def test_prime_discount_applies_to_crew_upkeep_summary(self) -> None:
+        service = self.make_service()
+        for name in ["Химико Тога", "Асуна Юкио", "Тай Ли"]:
+            service.create_cabin(name=name, rank="S", upkeep="1.2", subscription_tier="S")
+
+        inactive = service.crew_upkeep_summary()
+        self.assertEqual(inactive["base_total"], "3.600")
+        self.assertEqual(inactive["discount_total"], "0.000")
+        self.assertEqual(inactive["effective_total"], "3.600")
+
+        with service._connect() as conn:
+            service._set_meta(conn, "prime_active", "1")
+            service._set_meta(conn, "prime_active_since", "2026-05-12")
+
+        active = service.crew_upkeep_summary()
+        self.assertEqual(service.prime_status()["active_since"], "2026-05-12")
+        self.assertEqual(active["base_total"], "3.600")
+        self.assertEqual(active["discount_total"], "0.900")
+        self.assertEqual(active["effective_total"], "2.700")
+
+    def test_cabin_defect_excision_spends_ap_and_clears_recessive(self) -> None:
+        service = self.make_service()
+        service.add_income("20", "Старт")
+        cabin = service.create_cabin(
+            name="Химико Тога",
+            rank="S",
+            recessive_name="Кровавая Ревность",
+            recessive_description="Опасный недостаток.",
+        )
+
+        updated = service.excise_cabin_defect(cabin["id"])
+
+        self.assertEqual(updated["excised_defect"], "Кровавая Ревность")
+        self.assertEqual(updated["excision_cost"], "10.000")
+        self.assertEqual(updated["recessive_name"], "")
+        self.assertEqual(updated["recessive_description"], "")
+        self.assertEqual(service.get_wallet()["currencies"]["ap"], "10.000")
+        self.assertEqual(service.list_shop_purchases(limit=1)[0]["item_key"], "genesis.defect_excision")
+
+    def test_sr_promotion_requires_level_four_dominants_and_uses_shadow_ap(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._set_meta(conn, "prime_active", "1")
+            service._insert_transaction(
+                conn,
+                Decimal("5"),
+                "seed_shadow",
+                "Shadow seed",
+                currency="shadow_ap",
+            )
+        cabin = service.create_cabin(
+            name="Химико Тога",
+            rank="S",
+            upkeep="1.2",
+            dominants=[
+                {"name": "Мимикрия ДНК", "level": 4},
+                {"name": "Жажда Крови", "level": 4},
+                {"name": "Эмпатия Искажения", "level": 4},
+            ],
+        )
+
+        promoted = service.promote_cabin_to_sr(cabin["id"])
+
+        self.assertEqual(promoted["rank"], "SR")
+        self.assertEqual(promoted["upkeep"], "3.000")
+        self.assertEqual(promoted["effective_upkeep"], "2.250")
+        self.assertEqual(promoted["promotion_cost"], "2.250")
+        wallet = service.get_wallet()["currencies"]
+        self.assertEqual(wallet["ap"], "0.000")
+        self.assertEqual(wallet["shadow_ap"], "2.750")
+        rows = service.list_transactions(limit=2)
+        self.assertEqual(rows[0]["kind"], "shop_purchase")
+        self.assertEqual(rows[0]["amount"], "-2.250")
+
+    def test_terminal_upgrades_can_spend_shadow_ap_when_real_ap_is_empty(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._insert_transaction(
+                conn,
+                Decimal("5"),
+                "seed_shadow",
+                "Shadow seed",
+                currency="shadow_ap",
+            )
+
+        result = service.buy_core()
+
+        self.assertEqual(result.cost, Decimal("2.000"))
+        wallet = service.get_wallet()["currencies"]
+        self.assertEqual(wallet["ap"], "0.000")
+        self.assertEqual(wallet["shadow_ap"], "3.000")
+
+    def test_cabin_dominant_upgrade_spends_shadow_ap_when_real_ap_is_empty(self) -> None:
+        service = self.make_service()
+        with service._connect() as conn:
+            service._insert_transaction(
+                conn,
+                Decimal("5"),
+                "seed_shadow",
+                "Shadow seed",
+                currency="shadow_ap",
+            )
+        cabin = service.create_cabin(
+            name="Асуна Юкио",
+            rank="S",
+            dominants=[{"name": "Суб-Администратор", "level": 1}],
+        )
+
+        updated = service.upgrade_cabin_dominant(cabin["id"], 1)
+
+        self.assertEqual(updated["balance_before"], "0.000")
+        self.assertEqual(updated["balance_after"], "0.000")
+        self.assertEqual(updated["shadow_balance_before"], "5.000")
+        self.assertEqual(updated["shadow_balance_after"], "2.000")
+        wallet = service.get_wallet()["currencies"]
+        self.assertEqual(wallet["ap"], "0.000")
+        self.assertEqual(wallet["shadow_ap"], "2.000")
+
+    def test_dominant_upgrade_cannot_exceed_rank_limit(self) -> None:
+        service = self.make_service()
+        service.add_income("10", "Старт")
+        cabin = service.create_cabin(
+            name="Асуна Юкио",
+            rank="S",
+            dominants=[{"name": "Суб-Администратор", "level": 3}],
+        )
+
+        with self.assertRaises(Exception):
+            service.upgrade_cabin_dominant(cabin["id"], 1)
+
+    def test_prime_extends_dominant_limit_by_one(self) -> None:
+        service = self.make_service()
+        service.add_income("10", "Старт")
+        with service._connect() as conn:
+            service._set_meta(conn, "prime_active", "1")
+        cabin = service.create_cabin(
+            name="Асуна Юкио",
+            rank="S",
+            dominants=[{"name": "Суб-Администратор", "level": 3}],
+        )
+
+        upgraded = service.upgrade_cabin_dominant(cabin["id"], 1)
+
+        self.assertEqual(upgraded["level_after"], 4)
+        self.assertEqual(upgraded["dominant_max_level"], 4)
+        with self.assertRaises(Exception):
+            service.upgrade_cabin_dominant(cabin["id"], 1)
+
+    def test_create_cabin_rejects_dominant_above_rank_limit(self) -> None:
+        service = self.make_service()
+
+        with self.assertRaises(ValueError):
+            service.create_cabin(
+                name="Асуна Юкио",
+                rank="S",
+                dominants=[{"name": "Суб-Администратор", "level": 4}],
+            )
+
+    def test_update_cabin_rejects_dominant_above_rank_limit(self) -> None:
+        service = self.make_service()
+        cabin = service.create_cabin(
+            name="Асуна Юкио",
+            rank="S",
+            dominants=[{"name": "Суб-Администратор", "level": 3}],
+        )
+
+        with self.assertRaises(ValueError):
+            service.update_cabin(
+                cabin["id"],
+                dominants=[{"name": "Суб-Администратор", "level": 4}],
+            )
+
+    def test_active_crew_dominants_apply_to_task_rewards(self) -> None:
+        service = self.make_service()
+        service.create_cabin(
+            sample_code="02",
+            name="Асуна Юкио",
+            universe="SAO.V1",
+            rank="S",
+            sedative_dose="7",
+            dominants=[
+                {"name": "Суб-Администратор", "level": 1},
+                {"name": "Скорость Вспышки", "level": 1},
+            ],
+        )
+
+        task = service.complete_task(title="Кодовая задача", vector="code", units=1)
+
+        # S-rank cap 130% - 7% SD = 123% efficiency.
+        # Base: 0.2 + (0.02 * 1.23) => 0.225.
+        # Code multiplier: 1 + (0.10 * 1.23) => 1.123.
+        self.assertEqual(task.reward, Decimal("0.253"))
+        row = service.list_tasks(limit=1)[0]
+        self.assertEqual(Decimal(row["base_rate"]), Decimal("0.225"))
+        self.assertEqual(Decimal(row["vector_multiplier"]), Decimal("1.123"))
+        self.assertEqual(Decimal(row["crew_vector_bonus"]), Decimal("0.123"))
+
+    def test_crew_vector_bonus_is_part_of_vector_multiplier(self) -> None:
+        service = self.make_service()
+        service.create_cabin(
+            sample_code="02",
+            name="Асуна Юкио",
+            universe="SAO.V1",
+            rank="S",
+            sedative_dose="0",
+            dominants=[{"name": "Суб-Администратор", "level": 1}],
+        )
+
+        task = service.complete_task(
+            title="Закрыть ТЗ",
+            vector="code",
+            units=1,
+            full_close=True,
+        )
+
+        self.assertEqual(task.reward, Decimal("0.339"))
+        row = service.list_tasks(limit=1)[0]
+        self.assertEqual(Decimal(row["vector_multiplier"]), Decimal("1.130"))
+        self.assertEqual(Decimal(row["full_close_bonus"]), Decimal("1.500"))
+        self.assertEqual(Decimal(row["crew_vector_bonus"]), Decimal("0.130"))
+
+    def test_active_crew_dominants_apply_shop_flat_discounts(self) -> None:
+        service = self.make_service()
+        service.create_cabin(
+            sample_code="01",
+            name="Химико Тога",
+            rank="S",
+            sedative_dose="37",
+            dominants=[{"name": "Мимикрия ДНК", "level": 1}],
+        )
+        service.create_cabin(
+            sample_code="03",
+            name="Тай Ли",
+            rank="S",
+            sedative_dose="0.5",
+            dominants=[{"name": "Блокировка Точек", "level": 1}],
+        )
+
+        infiltrator = service.quote_shop_purchase("world.infiltrator")
+        skip = service.quote_shop_purchase("world.skip", options={"obstacles": 1})
+
+        self.assertEqual(infiltrator["full_cost"], "0.500")
+        self.assertEqual(infiltrator["discount"], "0.400")
+        self.assertEqual(infiltrator["final_cost"], "0.100")
+        self.assertEqual(skip["full_cost"], "1.000")
+        self.assertEqual(skip["discount"], "0.300")
+        self.assertEqual(skip["final_cost"], "0.700")
+
+    def test_active_crew_full_close_bonus_applies_to_task_rewards(self) -> None:
+        service = self.make_service()
+        service.create_cabin(
+            sample_code="03",
+            name="Тай Ли",
+            rank="S",
+            sedative_dose="0.5",
+            dominants=[{"name": "Чтение Ауры", "level": 1}],
+        )
+
+        task = service.complete_task(title="Закрыть ТЗ", vector="code", units=1, full_close=True)
+
+        self.assertEqual(task.reward, Decimal("0.308"))
+        self.assertEqual(Decimal(service.list_tasks(limit=1)[0]["full_close_bonus"]), Decimal("1.539"))
+
+    def test_crew_tag_set_bonuses_apply_to_shop_quotes_and_rewards(self) -> None:
+        service = self.make_service()
+        for index, tags in enumerate(
+            [
+                "[Киберпространство], [Фэнтези], [Эрудит], [Нестабильность], [Постапокалипсис]",
+                "[Киберпространство], [Фэнтези], [Эрудит], [Нестабильность], [Постапокалипсис]",
+                "[Киберпространство], [Фэнтези], [Эрудит], [Нестабильность], [Постапокалипсис]",
+            ],
+            start=1,
+        ):
+            service.create_cabin(
+                sample_code=f"T{index}",
+                name=f"Тест #{index}",
+                rank="S",
+                tags=tags,
+            )
+
+        vector = service.quote_vector_upgrade("code")
+        adaptation = service.quote_shop_purchase("world.adaptation")
+        prerequisite = service.quote_shop_purchase("world.prerequisite")
+        intel = service.quote_shop_purchase("expedition.intel")
+        extractor = service.quote_shop_purchase("hub.extractor")
+        task = service.complete_task(title="Закрыть ТЗ", vector="code", units=1, full_close=True)
+
+        self.assertEqual(vector.full_cost, Decimal("0.500"))
+        self.assertEqual(vector.discount, Decimal("0.075"))
+        self.assertEqual(vector.final_cost, Decimal("0.425"))
+        self.assertEqual(adaptation["final_cost"], "0.700")
+        self.assertEqual(prerequisite["final_cost"], "0.700")
+        self.assertEqual(intel["final_cost"], "0.000")
+        self.assertEqual(extractor["final_cost"], "0.250")
+        self.assertEqual(task.reward, Decimal("0.360"))
+        self.assertEqual(Decimal(service.list_tasks(limit=1)[0]["full_close_bonus"]), Decimal("1.800"))
 
     def test_premium_queue_tracks_tasks_without_changing_original_reward(self) -> None:
         service = self.make_service()

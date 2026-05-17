@@ -13,3 +13,7 @@ build/
 .env
 .agents
 .claude
+.playwright/
+skills-lock.json
+*.docx
+*:Zone.Identifier

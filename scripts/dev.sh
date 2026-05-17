@@ -62,16 +62,43 @@ export VITE_YELLKA_WEB_TOKEN="$YELLKA_WEB_TOKEN"
 
 api_pid=""
 web_pid=""
+cleanup_done=0
 
 cleanup() {
-  if [ -n "$web_pid" ] && kill -0 "$web_pid" 2>/dev/null; then
-    kill "$web_pid" 2>/dev/null || true
+  if [ "$cleanup_done" -eq 1 ]; then
+    return
   fi
-  if [ -n "$api_pid" ] && kill -0 "$api_pid" 2>/dev/null; then
-    kill "$api_pid" 2>/dev/null || true
-  fi
+  cleanup_done=1
+  stop_process_tree "$web_pid"
+  stop_process_tree "$api_pid"
 }
-trap cleanup EXIT INT TERM
+
+stop_process_tree() {
+  local pid="${1:-}"
+  local child
+  local attempt
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    return
+  fi
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    stop_process_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  for attempt in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return
+    fi
+    sleep 0.1
+  done
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    stop_process_tree "$child"
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 echo "Starting Yellka Shop 3.0"
 echo "API:      http://$YELLKA_WEB_HOST:$YELLKA_WEB_PORT"
@@ -112,4 +139,7 @@ cd "$WEB_DIR"
 npm run dev -- --host "$VITE_HOST" --port "$VITE_PORT" --strictPort &
 web_pid="$!"
 
-wait "$web_pid"
+wait -n "$api_pid" "$web_pid"
+status="$?"
+cleanup
+exit "$status"
